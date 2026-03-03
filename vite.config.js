@@ -11,6 +11,7 @@ export default defineConfig(() => ({
     // (add any other tunnel hostnames here as needed)
     allowedHosts: [
       'isanomalous-shelia-exasperatedly.ngrok-free.dev',
+      'shopify-reports-six.vercel.app',
     ],
   },
   plugins: [react()],
