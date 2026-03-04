@@ -17,6 +17,7 @@ import ReportDiagnostics from "./pages/ReportDiagnostics";
 import ProductCountDiagnostics from "./pages/ProductCountDiagnostics";
 import ShopifyCallback from "./pages/ShopifyCallback";
 import { Organizations } from "./pages/Organizations";
+import PrivacyPolicy from "./pages/PrivacyPolicy";
 import { ensureValidSession, startSessionKeepAlive } from "./lib/supabase";
 
 const queryClient = new QueryClient();
@@ -131,7 +132,8 @@ const App = () => {
                   </ProtectedRoute>
                 }
               />
-              {/* Public report share link - NO authentication required */}
+              {/* Public pages - NO authentication required */}
+              <Route path="/privacy-policy" element={<PrivacyPolicy />} />
               <Route path="/report/share/:shareLink" element={<PublicReport />} />
               {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
               <Route path="*" element={<NotFound />} />

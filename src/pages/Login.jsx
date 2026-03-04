@@ -7,6 +7,7 @@ import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { toast } from '@/hooks/use-toast';
 import { Store, Loader2, Mail } from 'lucide-react';
+import { Link } from 'react-router-dom';
 
 export default function Login() {
   const [email, setEmail] = useState('');
@@ -233,6 +234,12 @@ export default function Login() {
           )}
         </CardContent>
       </Card>
+
+      <p className="mt-4 text-center text-xs text-slate-400">
+        <Link to="/privacy-policy" className="hover:text-white hover:underline transition-colors">
+          Privacy Policy
+        </Link>
+      </p>
     </div>
   );
 }
