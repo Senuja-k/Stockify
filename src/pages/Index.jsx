@@ -122,9 +122,9 @@ function Index() {
   const [isLoadingPage, setIsLoadingPage] = useState(false);
   const [error, setError] = useState(null);
 
-  // Sync metadata (persisted)
-  const lastSyncAt = useProductsStore((state) => state.lastSyncAt);
-  const setLastSyncAt = useProductsStore((state) => state.setLastSyncAt);
+  // Sync metadata — org-level (fetched from DB, not per-user localStorage)
+  const [lastSyncAt, setLastSyncAt] = useState(null);
+  const setPersistedLastSyncAt = useProductsStore((state) => state.setLastSyncAt);
 
   // ✅ NEW: background sync indicator for header
   const [isSyncing, setIsSyncing] = useState(false);
@@ -227,21 +227,27 @@ function Index() {
   }, [location.pathname]);
 
   // On mount (or when location changes), if a pending reload was set while
-  // Index was unmounted, trigger a soft recovery (session refresh + refetch).
+  // Index was unmounted, refresh the session then trigger a full page reload.
   useEffect(() => {
     try {
       const pending = sessionStorage.getItem("home-reload-pending") === "1";
       if (pending) {
           sessionStorage.removeItem("home-reload-pending");
-          console.log('[Index] home-reload-pending detected on mount — soft recovery');
+          console.log('[Index] home-reload-pending detected on mount');
           if (location && location.pathname === "/") {
-            ensureValidSession(10000, true).then(() => {
-              fetchPageRef.current?.({
-                page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-                showPageLoader: false,
-                includeCount: true,
-              });
-            }).catch(() => {});
+            if (isSyncingRef.current) {
+              console.log('[Index] reload skipped due to active sync; performing soft recovery');
+              ensureValidSession(10000, true).then(() => {
+                fetchPageRef.current?.({
+                  page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
+                  showPageLoader: false,
+                  includeCount: true,
+                });
+              }).catch(() => {});
+            } else {
+              console.log('[Index] home-reload-pending — reloading now');
+              window.location.reload();
+            }
           }
         }
     } catch (e) {
@@ -249,8 +255,8 @@ function Index() {
     }
   }, [location.pathname]);
 
-  // When returning to the home page after leaving it, soft-recover
-  // by refreshing the session and refetching data (not a full page reload).
+  // When returning to the home page after leaving it, refresh session then
+  // do a full page reload so the app re-initializes cleanly for the new context.
   useEffect(() => {
     const prevPath = lastPathRef.current;
     const nextPath = location.pathname;
@@ -258,22 +264,25 @@ function Index() {
     // Update lastPathRef for next navigation
     lastPathRef.current = nextPath;
 
-    // If this is the initial mount, prevPath will be falsy — skip.
+    // If this is the initial mount, prevPath will be falsy — skip reload.
     if (!prevPath) return;
 
-    // If we navigated into home from a different path, soft-recover.
+    // If we navigated into home from a different path, do a full reload.
     if (nextPath === '/' && prevPath !== '/' && !hasTriggeredHomeReloadRef.current) {
       hasTriggeredHomeReloadRef.current = true;
-      console.log('[Index] navigated into home — refreshing session and refetching data');
-      ensureValidSession(10000, true).then(() => {
-        fetchPageRef.current?.({
-          page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
-          showPageLoader: false,
-          includeCount: true,
-        });
-      }).catch((e) => {
-        console.warn('[Index] soft recovery after route change failed:', e);
-      });
+      if (isSyncingRef.current) {
+        console.log('[Index] navigated into home but sync active — doing soft recovery');
+        ensureValidSession(10000, true).then(() => {
+          fetchPageRef.current?.({
+            page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
+            showPageLoader: false,
+            includeCount: true,
+          });
+        }).catch(() => {});
+      } else {
+        console.log('[Index] navigated into home — reloading now');
+        window.location.reload();
+      }
     }
   }, [location.pathname]);
 
@@ -639,6 +648,21 @@ function Index() {
     ensureStoresThenFetch();
   }, [ensureStoresThenFetch]);
 
+  // ✅ Fetch org-level last sync time from DB so all users in the same org
+  //    see the same "Last sync" timestamp.
+  useEffect(() => {
+    if (!activeOrganizationId || storeIds.length === 0) return;
+    let cancelled = false;
+    getOrgLastSyncTime(activeOrganizationId, storeIds)
+      .then((ts) => {
+        if (!cancelled && ts) {
+          setLastSyncAt(ts);
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [activeOrganizationId, storeIds]);
+
   // -------------------------------------------------------------------
   // Manual refresh/sync entry point
   // -------------------------------------------------------------------
@@ -694,11 +718,13 @@ function Index() {
             const ts = dbLast || new Date().toISOString();
             console.log('[Index] set lastSyncAt (DB or fallback) ->', ts);
             setLastSyncAt(ts);
+            setPersistedLastSyncAt(ts);
           } catch (e) {
             console.warn('[Index] failed to read last sync from DB, falling back to client timestamp', e);
             try {
               const ts = new Date().toISOString();
               setLastSyncAt(ts);
+              setPersistedLastSyncAt(ts);
             } catch (err) {
               console.error('[Index] failed to set lastSyncAt fallback:', err);
             }
@@ -738,6 +764,7 @@ function Index() {
       storesToFetch,
       activeOrganizationId,
       setLastSyncAt,
+      setPersistedLastSyncAt,
     ],
   );
 
@@ -825,25 +852,31 @@ function Index() {
           pageSize,
         });
 
-        // ✅ CHANGED: Instead of a full page reload (which can lose session
-        //    state and cause all-zero stats), always do a soft recovery:
-        //    refresh the session token first, then refetch data.
+        // If we're on the dashboard home page, refresh session first then
+        // do a full page reload so the app re-initializes cleanly.
         try {
-          console.log('[Index] Tab visible again — refreshing session and refetching data');
-          ensureValidSession(10000, true).then(() => {
-            fetchPageRef.current?.({
-              page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-              showPageLoader: false,
-              includeCount: true,
-            });
-          }).catch(() => {});
-          return;
+          if (location && location.pathname === "/") {
+            if (isSyncingRef.current) {
+              console.log('[Index] Home visible but sync active — doing soft recovery');
+              ensureValidSession(10000, true).then(() => {
+                fetchPageRef.current?.({
+                  page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
+                  showPageLoader: false,
+                  includeCount: true,
+                });
+              }).catch(() => {});
+              return;
+            }
+            console.log('[Index] Home visible — reloading now');
+            window.location.reload();
+            return;
+          }
         } catch (e) {
           console.warn('[Index] failed to perform location check for reload', e);
         }
 
         // Soft recovery for other routes: refresh session then refetch current page
-        ensureValidSession(8000, true).then(() => {
+        ensureValidSession(10000, true).then(() => {
           fetchPageRef.current?.({
             page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
             showPageLoader: false,
