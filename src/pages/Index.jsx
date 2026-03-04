@@ -227,26 +227,21 @@ function Index() {
   }, [location.pathname]);
 
   // On mount (or when location changes), if a pending reload was set while
-  // Index was unmounted, trigger the full reload now.
+  // Index was unmounted, trigger a soft recovery (session refresh + refetch).
   useEffect(() => {
     try {
       const pending = sessionStorage.getItem("home-reload-pending") === "1";
       if (pending) {
           sessionStorage.removeItem("home-reload-pending");
-          console.log('[Index] home-reload-pending detected on mount');
+          console.log('[Index] home-reload-pending detected on mount — soft recovery');
           if (location && location.pathname === "/") {
-            if (isSyncingRef.current) {
-              console.log('[Index] reload skipped due to active sync; performing soft recovery');
-              ensureValidSession(8000, true).then(() => {
-                fetchPageRef.current?.({
-                  page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-                  showPageLoader: false,
-                  includeCount: true,
-                });
-              }).catch(() => {});
-            } else {
-              window.location.reload();
-            }
+            ensureValidSession(10000, true).then(() => {
+              fetchPageRef.current?.({
+                page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
+                showPageLoader: false,
+                includeCount: true,
+              });
+            }).catch(() => {});
           }
         }
     } catch (e) {
@@ -255,8 +250,7 @@ function Index() {
   }, [location.pathname]);
 
   // When returning to the home page after leaving it, soft-recover
-  // Reload when route changes into home ("/") from another route.
-  // Skip the reload on initial mount (prevPath may be empty).
+  // by refreshing the session and refetching data (not a full page reload).
   useEffect(() => {
     const prevPath = lastPathRef.current;
     const nextPath = location.pathname;
@@ -264,36 +258,22 @@ function Index() {
     // Update lastPathRef for next navigation
     lastPathRef.current = nextPath;
 
-    // If this is the initial mount, prevPath will be falsy — skip reload.
+    // If this is the initial mount, prevPath will be falsy — skip.
     if (!prevPath) return;
 
-    // If we navigated into home from a different path, do a full reload.
+    // If we navigated into home from a different path, soft-recover.
     if (nextPath === '/' && prevPath !== '/' && !hasTriggeredHomeReloadRef.current) {
-      try {
-        console.log('[Index] navigated into home — performing full reload');
-        hasTriggeredHomeReloadRef.current = true;
-        if (isSyncingRef.current) {
-          console.log('[Index] navigated into home but sync active — skipping full reload and doing soft recovery');
-          ensureValidSession(8000, true).then(() => {
-            fetchPageRef.current?.({
-              page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
-              showPageLoader: false,
-              includeCount: true,
-            });
-          }).catch(() => {});
-        } else {
-          window.location.reload();
-        }
-      } catch (e) {
-        console.warn('[Index] reload failed, falling back to soft recovery', e);
-        ensureValidSession(8000, true).then(() => {
-          fetchPageRef.current?.({
-            page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
-            showPageLoader: false,
-            includeCount: true,
-          });
-        }).catch(() => {});
-      }
+      hasTriggeredHomeReloadRef.current = true;
+      console.log('[Index] navigated into home — refreshing session and refetching data');
+      ensureValidSession(10000, true).then(() => {
+        fetchPageRef.current?.({
+          page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
+          showPageLoader: false,
+          includeCount: true,
+        });
+      }).catch((e) => {
+        console.warn('[Index] soft recovery after route change failed:', e);
+      });
     }
   }, [location.pathname]);
 
@@ -441,6 +421,53 @@ function Index() {
         if (controller.signal.aborted) return;
         if (reqId !== pageReqIdRef.current) return; // ✅ ignore stale response
 
+        // ✅ RLS ghost detection: if we have stores but the query returned 0
+        // rows, the session token may have expired (Supabase RLS silently
+        // returns empty sets instead of errors for invalid JWTs). Force a
+        // session refresh and retry once.
+        if (
+          pageResult.data.length === 0 &&
+          effectiveStoreIds.length > 0 &&
+          !opts._isRetryAfterRefresh
+        ) {
+          console.warn(
+            "[Index] 0 products returned despite having stores — possible expired session (RLS ghost). Refreshing session and retrying..."
+          );
+          const refreshOk = await refreshSessionSilently(10000);
+          if (refreshOk) {
+            // Retry the same fetchPage call once with a flag to prevent loops
+            try {
+              const retryQuery = () =>
+                queryProductsPage({
+                  userId,
+                  storeIds: effectiveStoreIds,
+                  organizationId: activeOrganizationId || undefined,
+                  filterConfig: filters,
+                  sortField: sort,
+                  sortDirection: dir,
+                  pageIndex: page,
+                  pageSize: size,
+                  signal: controller.signal,
+                  includeCount,
+                  totalCountHint,
+                });
+              const retryResult = await retryQuery();
+              if (!controller.signal.aborted && reqId === pageReqIdRef.current) {
+                pageResult = retryResult;
+                console.log(
+                  "[Index] RLS ghost retry returned",
+                  retryResult.data.length,
+                  "products"
+                );
+              }
+            } catch (retryErr) {
+              if (!isAbortError(retryErr)) {
+                console.error("[Index] RLS ghost retry failed:", retryErr);
+              }
+            }
+          }
+        }
+
         const products = pageResult.data.map((p) => ({
           ...p,
           storeName:
@@ -468,7 +495,7 @@ function Index() {
             if (statsController.signal.aborted) return;
             setStats((prev) => ({
               ...prev,
-              totalProducts: pageResult.totalCount,
+              totalProducts: statsResult.totalProducts || pageResult.totalCount,
               totalStores: statsResult.totalStores,
               totalVendors: statsResult.totalVendors,
               totalTypes: statsResult.totalTypes,
@@ -554,6 +581,15 @@ function Index() {
       return;
     }
 
+    // ✅ Proactively validate / refresh the session before making
+    //    data queries. This prevents the "RLS ghost" problem where
+    //    an expired JWT causes all queries to silently return 0 rows.
+    try {
+      await ensureValidSession(8000, true);
+    } catch (e) {
+      console.warn("[Index] ensureStoresThenFetch: session check failed:", e);
+    }
+
     // ✅ Only load stores if empty (do NOT force every time)
     const sm = useStoreManagement.getState();
     if (sm.stores.length === 0 && !sm.isLoading) {
@@ -613,6 +649,14 @@ function Index() {
         return;
       }
       if (isSyncingRef.current) return;
+
+      // ✅ Always refresh the session before a manual sync/refresh to avoid
+      //    silent RLS-ghost failures where an expired token returns 0 rows.
+      try {
+        await ensureValidSession(10000, true);
+      } catch (e) {
+        console.warn("[Index] checkSyncAndLoad: session refresh failed:", e);
+      }
 
       try {
         if (forceSync) {
@@ -781,27 +825,19 @@ function Index() {
           pageSize,
         });
 
-        // If we're on the dashboard home page, perform a full reload to
-        // ensure a clean app state (user requested behavior). Otherwise
-        // perform the previous soft-recovery flow.
+        // ✅ CHANGED: Instead of a full page reload (which can lose session
+        //    state and cause all-zero stats), always do a soft recovery:
+        //    refresh the session token first, then refetch data.
         try {
-          if (location && location.pathname === "/") {
-            if (isSyncingRef.current) {
-              console.log('[Index] Home visible but sync active — skipping full reload and doing soft recovery');
-              ensureValidSession(8000, true).then(() => {
-                fetchPageRef.current?.({
-                  page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-                  showPageLoader: false,
-                  includeCount: true,
-                });
-              }).catch(() => {});
-              return;
-            }
-            console.log('[Index] Home visible — performing full page reload');
-            // Force a full reload from the server
-            window.location.reload();
-            return;
-          }
+          console.log('[Index] Tab visible again — refreshing session and refetching data');
+          ensureValidSession(10000, true).then(() => {
+            fetchPageRef.current?.({
+              page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
+              showPageLoader: false,
+              includeCount: true,
+            });
+          }).catch(() => {});
+          return;
         } catch (e) {
           console.warn('[Index] failed to perform location check for reload', e);
         }

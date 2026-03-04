@@ -386,12 +386,16 @@ export async function queryProductStats({
     }
   }
 
+  // Prefer actual rows.length over estimated count (which can be stale/0)
+  const actualTotal = rows.length > 0 ? rows.length : (count || 0);
+
   return {
-    totalProducts: count ?? rows.length,
+    totalProducts: actualTotal,
     totalStores: storeSet.size,
     totalVendors: vendors.size,
     totalTypes: types.size,
     avgPrice: priceCount > 0 ? priceSum / priceCount : 0,
+    _rowCount: rows.length, // internal: actual rows fetched (for session health check)
   };
   }, "queryProductStats");
 }
