@@ -9,9 +9,9 @@ export default defineConfig(() => ({
     port: 8082,
     // Allow dev access from ngrok tunnel hostname used during local testing
     // (add any other tunnel hostnames here as needed)
-    allowedHosts: [
+      allowedHosts: [
       'isanomalous-shelia-exasperatedly.ngrok-free.dev',
-      'shopify-reports-six.vercel.app',
+      'stockify-virid.vercel.app',
     ],
   },
   plugins: [react()],
