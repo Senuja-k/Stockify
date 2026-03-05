@@ -147,8 +147,6 @@ function Index() {
   // ✅ NEW: prevent double refresh spam on tab return
   const returnDebounceRef = useRef(0);
   const tabRefreshInFlightRef = useRef(false);
-  const hasTriggeredHomeReloadRef = useRef(false);
-  const lastPathRef = useRef("");
 
   // ✅ NEW: freshness tracking to avoid unnecessary work
   const lastDataFetchAtRef = useRef(0);
@@ -205,86 +203,80 @@ function Index() {
     }
   }, []);
 
-  // If Index unmounts while on the home page, mark a pending reload so
-  // when the user navigates back (and Index remounts) we can force a reload.
+  // -------------------------------------------------------------------
+  // Force a fresh data load whenever the dashboard mounts.
+  // This covers: navigating back from Custom Reports, returning from
+  // another tab, or any other scenario where Index remounts.
+  // -------------------------------------------------------------------
+  const mountIdRef = useRef(0);
   useEffect(() => {
-    try {
-      // cleanup runs on unmount — capture current path
-      return () => {
-        try {
-          if (location && location.pathname === "/") {
-            sessionStorage.setItem("home-reload-pending", "1");
-            console.log('[Index] marking home-reload-pending on unmount');
-          }
-        } catch (e) {
-          // ignore
-        }
-      };
-    } catch (e) {
-      // ignore
-    }
-    // Depend on location.pathname so the cleanup knows the current route
-  }, [location.pathname]);
+    const myMount = ++mountIdRef.current;
+    console.log('[Index] mount — forcing fresh data load');
 
-  // On mount (or when location changes), if a pending reload was set while
-  // Index was unmounted, refresh the session then trigger a full page reload.
-  useEffect(() => {
-    try {
-      const pending = sessionStorage.getItem("home-reload-pending") === "1";
-      if (pending) {
-          sessionStorage.removeItem("home-reload-pending");
-          console.log('[Index] home-reload-pending detected on mount');
-          if (location && location.pathname === "/") {
-            if (isSyncingRef.current) {
-              console.log('[Index] reload skipped due to active sync; performing soft recovery');
-              ensureValidSession(10000, true).then(() => {
-                fetchPageRef.current?.({
-                  page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-                  showPageLoader: false,
-                  includeCount: true,
-                });
-              }).catch(() => {});
-            } else {
-              console.log('[Index] home-reload-pending — reloading now');
-              window.location.reload();
-            }
-          }
-        }
-    } catch (e) {
-      // ignore
-    }
-  }, [location.pathname]);
+    // Clear any stale home-reload-pending flags
+    try { sessionStorage.removeItem('home-reload-pending'); } catch (e) {}
 
-  // When returning to the home page after leaving it, refresh session then
-  // do a full page reload so the app re-initializes cleanly for the new context.
-  useEffect(() => {
-    const prevPath = lastPathRef.current;
-    const nextPath = location.pathname;
-    console.log('[Index] route-change detected', { prevPath, nextPath });
-    // Update lastPathRef for next navigation
-    lastPathRef.current = nextPath;
+    // Reset tracking so effects don't skip
+    initializedContextRef.current = '';
+    lastDataFetchAtRef.current = 0;
+    lastStatsFetchAtRef.current = 0;
 
-    // If this is the initial mount, prevPath will be falsy — skip reload.
-    if (!prevPath) return;
-
-    // If we navigated into home from a different path, do a full reload.
-    if (nextPath === '/' && prevPath !== '/' && !hasTriggeredHomeReloadRef.current) {
-      hasTriggeredHomeReloadRef.current = true;
-      if (isSyncingRef.current) {
-        console.log('[Index] navigated into home but sync active — doing soft recovery');
-        ensureValidSession(10000, true).then(() => {
-          fetchPageRef.current?.({
-            page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
-            showPageLoader: false,
-            includeCount: true,
-          });
-        }).catch(() => {});
-      } else {
-        console.log('[Index] navigated into home — reloading now');
-        window.location.reload();
+    // Refresh session then force-load stores + data
+    (async () => {
+      try {
+        await ensureValidSession(8000, true);
+      } catch (e) {
+        console.warn('[Index] mount session refresh failed:', e);
       }
-    }
-  }, [location.pathname]);
+
+      // Bail if this mount was superseded
+      if (myMount !== mountIdRef.current) return;
+
+      // Force-load stores from DB (not just localStorage cache)
+      const sm = useStoreManagement.getState();
+      try {
+        await sm.loadStores({
+          organizationId: activeOrganizationId ?? undefined,
+          force: true,
+        });
+      } catch (e) {
+        console.warn('[Index] mount loadStores failed:', e);
+      }
+
+      if (myMount !== mountIdRef.current) return;
+
+      // Read latest store state and fetch data
+      const latestStores = useStoreManagement.getState().stores || [];
+      const latestSelectedStoreId = useStoreManagement.getState().selectedStoreId;
+      const latestViewMode = useStoreManagement.getState().viewMode;
+      const latestStoresToFetch = (() => {
+        if (latestViewMode === 'combined' && latestSelectedStoreId === null) return latestStores;
+        if (latestSelectedStoreId) {
+          const st = latestStores.find((s) => s.id === latestSelectedStoreId);
+          return st ? [st] : [];
+        }
+        return latestStores;
+      })();
+      const latestStoreIds = latestStoresToFetch.map((s) => s.id);
+
+      if (latestStoreIds.length === 0) {
+        console.log('[Index] mount — no stores to fetch');
+        setIsInitialLoading(false);
+        return;
+      }
+
+      console.log('[Index] mount — fetching data for', latestStoreIds.length, 'stores');
+      fetchPageRef.current?.({
+        page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
+        showPageLoader: false,
+        includeCount: true,
+        storeIdsOverride: latestStoreIds,
+        storesToFetchOverride: latestStoresToFetch,
+      });
+    })();
+
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Suppress noisy AbortError unhandled rejections during reloads.
   useEffect(() => {
@@ -576,77 +568,32 @@ function Index() {
   }, [pageIndex]);
 
   // -------------------------------------------------------------------
-  // Ensure stores are loaded, then fetch using latest store state
+  // Safety net: if loading finished but we have stores and no products,
+  // force a refetch. Catches any edge case where the normal fetch path
+  // silently failed (e.g. session race, abort, tab switch).
   // -------------------------------------------------------------------
-  const ensureStoresThenFetch = useCallback(async () => {
-    if (!isAuthenticated || !userId) return;
-
-    // ✅ If we already have data and it's still fresh, DO NOTHING
-    const last = lastDataFetchAtRef.current || 0;
-    const isFresh =
-      pageProducts.length > 0 && Date.now() - last < DATA_STALE_MS;
-    if (isFresh) {
-      
-      return;
-    }
-
-    // ✅ Proactively validate / refresh the session before making
-    //    data queries. This prevents the "RLS ghost" problem where
-    //    an expired JWT causes all queries to silently return 0 rows.
-    try {
-      await ensureValidSession(8000, true);
-    } catch (e) {
-      console.warn("[Index] ensureStoresThenFetch: session check failed:", e);
-    }
-
-    // ✅ Only load stores if empty (do NOT force every time)
-    const sm = useStoreManagement.getState();
-    if (sm.stores.length === 0 && !sm.isLoading) {
-      try {
-        await sm.loadStores({
-          organizationId: activeOrganizationId ?? undefined,
-          force: true,
-        });
-      } catch (e) {
-        console.error("[Index] ensureStoresThenFetch loadStores failed:", e);
-        return; // no stores, can't fetch
-      }
-    }
-
-    // ✅ Use latest store state
-    const latestStores = useStoreManagement.getState().stores || [];
-    const latestSelectedStoreId = useStoreManagement.getState().selectedStoreId;
-    const latestViewMode = useStoreManagement.getState().viewMode;
-
-    const latestStoresToFetch = (() => {
-      if (latestViewMode === "combined" && latestSelectedStoreId === null)
-        return latestStores;
-      if (latestSelectedStoreId) {
-        const st = latestStores.find((s) => s.id === latestSelectedStoreId);
-        return st ? [st] : [];
-      }
-      return latestStores;
-    })();
-
-    const latestStoreIds = latestStoresToFetch.map((s) => s.id);
-    if (latestStoreIds.length === 0) return;
-
-    await fetchPageRef.current({
-      showPageLoader: false,
-      storeIdsOverride: latestStoreIds,
-      storesToFetchOverride: latestStoresToFetch,
-    });
-  }, [
-    isAuthenticated,
-    userId,
-    activeOrganizationId,
-    pageProducts.length, // ✅ important so fresh check updates
-  ]);
-
-  // On mount/return, ensure stores are loaded and data is fetched.
   useEffect(() => {
-    ensureStoresThenFetch();
-  }, [ensureStoresThenFetch]);
+    if (isInitialLoading || isLoadingPage) return; // still loading
+    if (!isAuthenticated || !userId) return;
+    if (storeIds.length === 0) return; // no stores → nothing to fetch
+    if (pageProducts.length > 0) return; // we have data
+    if (error) return; // an error is already shown
+
+    console.warn('[Index] safety-net: loading done but 0 products with', storeIds.length, 'stores — forcing refetch');
+    // Small delay to avoid tight re-render loop
+    const timer = setTimeout(() => {
+      ensureValidSession(8000, true)
+        .catch(() => {})
+        .then(() => {
+          fetchPageRef.current?.({
+            page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
+            showPageLoader: false,
+            includeCount: true,
+          });
+        });
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [isInitialLoading, isLoadingPage, isAuthenticated, userId, storeIds.length, pageProducts.length, error]);
 
   // ✅ Fetch org-level last sync time from DB so all users in the same org
   //    see the same "Last sync" timestamp.
@@ -852,37 +799,22 @@ function Index() {
           pageSize,
         });
 
-        // If we're on the dashboard home page, refresh session first then
-        // do a full page reload so the app re-initializes cleanly.
-        try {
-          if (location && location.pathname === "/") {
-            if (isSyncingRef.current) {
-              console.log('[Index] Home visible but sync active — doing soft recovery');
-              ensureValidSession(10000, true).then(() => {
-                fetchPageRef.current?.({
-                  page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-                  showPageLoader: false,
-                  includeCount: true,
-                });
-              }).catch(() => {});
-              return;
-            }
-            console.log('[Index] Home visible — reloading now');
-            window.location.reload();
-            return;
-          }
-        } catch (e) {
-          console.warn('[Index] failed to perform location check for reload', e);
-        }
-
-        // Soft recovery for other routes: refresh session then refetch current page
-        ensureValidSession(10000, true).then(() => {
-          fetchPageRef.current?.({
-            page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-            showPageLoader: false,
-            includeCount: true,
+        // Soft recovery: refresh session then refetch current page data.
+        // (Avoids full page reload which can cause infinite loops or leave
+        //  the dashboard empty if the reload completes before auth initializes.)
+        console.log('[Index] Tab visible again — refreshing session and refetching data');
+        ensureValidSession(10000, true)
+          .catch(() => {})
+          .then(() => {
+            // Reset tracking so the fetch actually runs
+            initializedContextRef.current = '';
+            lastDataFetchAtRef.current = 0;
+            fetchPageRef.current?.({
+              page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
+              showPageLoader: false,
+              includeCount: true,
+            });
           });
-        }).catch(() => {});
       }
     };
 
