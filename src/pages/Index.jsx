@@ -15,8 +15,8 @@ import {
   queryAllFilteredProducts,
   queryProductStats,
 } from "@/lib/serverQueries";
-import { refreshSessionSilently, ensureValidSession } from "@/lib/supabase";
-import { syncStoresProductsFull, getOrgLastSyncTime } from "@/lib/shopifySync";
+import { refreshSessionSilently, ensureValidSession, supabase } from "@/lib/supabase";
+import { getOrgLastSyncTime } from "@/lib/shopifySync";
 import { useOrganization } from "@/stores/organizationStore";
 import { useAuth } from "@/stores/authStore.jsx";
 import { useLocation } from "react-router-dom";
@@ -59,6 +59,35 @@ function isAuthError(error) {
 }
 
 const DASHBOARD_VIEW_STATE_KEY = "dashboard-view-state";
+const RELOAD_PENDING_KEY = "reload-after-sync";
+
+/**
+ * Request a full page reload. If a sync is running, defers the reload
+ * until the sync completes (the sync-completion handler checks the flag).
+ * A 5-second cooldown prevents infinite reload loops.
+ */
+function requestReload(reason = "unknown") {
+  const isSyncing = useProductsStore.getState().isSyncing;
+  if (isSyncing) {
+    console.log(`[requestReload] sync in progress — deferring reload (reason: ${reason})`);
+    try { sessionStorage.setItem(RELOAD_PENDING_KEY, reason); } catch {}
+    return;
+  }
+
+  // Cooldown guard: prevent reload loops
+  try {
+    const last = Number(sessionStorage.getItem("last-auto-reload-at") || "0");
+    if (Date.now() - last < 5000) {
+      console.log(`[requestReload] cooldown active — skipping (reason: ${reason})`);
+      return;
+    }
+    sessionStorage.setItem("last-auto-reload-at", String(Date.now()));
+    sessionStorage.removeItem(RELOAD_PENDING_KEY);
+  } catch {}
+
+  console.log(`[requestReload] reloading now (reason: ${reason})`);
+  window.location.reload();
+}
 
 function readDashboardViewState() {
   try {
@@ -181,26 +210,16 @@ function Index() {
   // Cache store (instant restore after reload/back)
   const cache = useProductsPageCacheStore();
 
-  // If the app was backgrounded while on a different route, soft-recover
-  // (refresh session + refetch data) instead of a full page reload.
+  // If the app was backgrounded while on a different route, reload on mount.
   useEffect(() => {
     try {
       const wasHidden = sessionStorage.getItem("app-was-hidden");
       if (wasHidden) {
         sessionStorage.removeItem("app-was-hidden");
         sessionStorage.removeItem("app-last-hidden-at");
-        // Soft recovery: refresh session then refetch
-        ensureValidSession(8000, true).then(() => {
-          fetchPageRef.current?.({
-            page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-            showPageLoader: false,
-            includeCount: true,
-          });
-        }).catch(() => {});
+        requestReload("app-was-hidden");
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch (e) {}
   }, []);
 
   // -------------------------------------------------------------------
@@ -569,18 +588,28 @@ function Index() {
 
   // -------------------------------------------------------------------
   // Safety net: if loading finished but we have stores and no products,
-  // force a refetch. Catches any edge case where the normal fetch path
-  // silently failed (e.g. session race, abort, tab switch).
+  // try a soft refetch once; if still empty, request a full reload.
   // -------------------------------------------------------------------
+  const safetyNetRetryRef = useRef(0);
   useEffect(() => {
-    if (isInitialLoading || isLoadingPage) return; // still loading
+    if (isInitialLoading || isLoadingPage) return;
     if (!isAuthenticated || !userId) return;
-    if (storeIds.length === 0) return; // no stores → nothing to fetch
-    if (pageProducts.length > 0) return; // we have data
-    if (error) return; // an error is already shown
+    if (storeIds.length === 0) return;
+    if (pageProducts.length > 0) {
+      safetyNetRetryRef.current = 0;
+      return;
+    }
+    if (error) return;
 
-    console.warn('[Index] safety-net: loading done but 0 products with', storeIds.length, 'stores — forcing refetch');
-    // Small delay to avoid tight re-render loop
+    safetyNetRetryRef.current += 1;
+    const attempt = safetyNetRetryRef.current;
+    console.warn('[Index] safety-net: 0 products with', storeIds.length, 'stores — attempt', attempt);
+
+    if (attempt >= 2) {
+      requestReload("safety-net-empty");
+      return;
+    }
+
     const timer = setTimeout(() => {
       ensureValidSession(8000, true)
         .catch(() => {})
@@ -611,7 +640,10 @@ function Index() {
   }, [activeOrganizationId, storeIds]);
 
   // -------------------------------------------------------------------
-  // Manual refresh/sync entry point
+  // Manual refresh/sync entry point.
+  // Sync always runs server-side (Edge Function) so it survives tab
+  // switches, minimization, and even closing the browser tab.
+  // When sync completes, if a reload was deferred, it fires now.
   // -------------------------------------------------------------------
   const checkSyncAndLoad = useCallback(
     async (forceSync = false) => {
@@ -621,8 +653,6 @@ function Index() {
       }
       if (isSyncingRef.current) return;
 
-      // ✅ Always refresh the session before a manual sync/refresh to avoid
-      //    silent RLS-ghost failures where an expired token returns 0 rows.
       try {
         await ensureValidSession(10000, true);
       } catch (e) {
@@ -633,49 +663,42 @@ function Index() {
         if (forceSync) {
           setIsInitialLoading(true);
           setIsSyncing(true);
-          // Prefer server-side sync to avoid browser background throttling.
+
+          // Always use server-side sync (runs in Supabase Edge Function,
+          // independent of the browser tab lifecycle).
           const payload = {
             storeIds: (storesToFetch || []).map((s) => s.id),
             organizationId: activeOrganizationId || null,
           };
-          if (typeof supabase !== 'undefined' && supabase.functions && supabase.functions.invoke) {
-            try {
-              const fnResp = await supabase.functions.invoke('sync-stores', { body: JSON.stringify(payload) });
-              if (fnResp && fnResp.data) {
-                console.log('[Index] server-side sync response', fnResp.data);
-              } else {
-                console.warn('[Index] server-side sync returned no data; falling back to client sync');
-                await syncStoresProductsFull(userId, storesToFetch, activeOrganizationId || undefined);
-              }
-            } catch (err) {
-              console.error('[Index] server-side sync failed, falling back to client sync', err);
-              await syncStoresProductsFull(userId, storesToFetch, activeOrganizationId || undefined);
-            }
-          } else {
-            // No server functions available in this environment — run client-side sync
-            await syncStoresProductsFull(userId, storesToFetch, activeOrganizationId || undefined);
-          }
           try {
-            // Prefer authoritative DB timestamp from shopify_store_sync_status
+            const fnResp = await supabase.functions.invoke('sync-stores', {
+              body: JSON.stringify(payload),
+            });
+            if (fnResp?.error) {
+              console.error('[Index] server-side sync error:', fnResp.error);
+            } else {
+              console.log('[Index] server-side sync response', fnResp?.data);
+            }
+          } catch (err) {
+            console.error('[Index] server-side sync failed:', err);
+          }
+
+          // Read last-sync timestamp from DB
+          try {
             const storeIdsForQuery = (storesToFetch || []).map((s) => s.id);
             const dbLast = await getOrgLastSyncTime(
               activeOrganizationId || undefined,
               storeIdsForQuery,
             );
             const ts = dbLast || new Date().toISOString();
-            console.log('[Index] set lastSyncAt (DB or fallback) ->', ts);
             setLastSyncAt(ts);
             setPersistedLastSyncAt(ts);
           } catch (e) {
-            console.warn('[Index] failed to read last sync from DB, falling back to client timestamp', e);
-            try {
-              const ts = new Date().toISOString();
-              setLastSyncAt(ts);
-              setPersistedLastSyncAt(ts);
-            } catch (err) {
-              console.error('[Index] failed to set lastSyncAt fallback:', err);
-            }
+            const ts = new Date().toISOString();
+            setLastSyncAt(ts);
+            setPersistedLastSyncAt(ts);
           }
+
           await fetchPageRef.current({
             page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
             showPageLoader: false,
@@ -701,7 +724,19 @@ function Index() {
           setError(err instanceof Error ? err.message : "Failed to load");
         }
       } finally {
-        if (forceSync) setIsSyncing(false);
+        if (forceSync) {
+          setIsSyncing(false);
+          // If a reload was deferred while syncing, do it now.
+          try {
+            const pending = sessionStorage.getItem(RELOAD_PENDING_KEY);
+            if (pending) {
+              console.log('[Index] sync done — executing deferred reload (reason:', pending, ')');
+              sessionStorage.removeItem(RELOAD_PENDING_KEY);
+              // Small delay so the UI can paint the "sync done" state
+              setTimeout(() => requestReload("deferred-post-sync"), 300);
+            }
+          } catch {}
+        }
         setIsInitialLoading(false);
       }
     },
@@ -774,7 +809,31 @@ function Index() {
     });
   }, [pageIndex, sortField, sortDirection, appliedFilterConfig, pageSize]);
 
-  // Soft-recover on tab switch (hidden -> visible): refresh session + refetch data.
+  // Full page reload when user switches stores in the dropdown.
+  const prevSelectedStoreIdRef = useRef(selectedStoreId);
+  useEffect(() => {
+    const prev = prevSelectedStoreIdRef.current;
+    prevSelectedStoreIdRef.current = selectedStoreId;
+    // Skip the very first render (mount)
+    if (prev === undefined) return;
+    if (prev !== selectedStoreId) {
+      requestReload("store-switch");
+    }
+  }, [selectedStoreId]);
+
+  // Full page reload when user switches organization.
+  const prevOrgIdRef = useRef(activeOrganizationId);
+  useEffect(() => {
+    const prev = prevOrgIdRef.current;
+    prevOrgIdRef.current = activeOrganizationId;
+    if (prev === undefined) return;
+    if (prev !== activeOrganizationId) {
+      requestReload("org-switch");
+    }
+  }, [activeOrganizationId]);
+
+  // Full page reload when user returns to this tab.
+  // Deferred if a product sync is running (requestReload handles the guard).
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
@@ -791,30 +850,7 @@ function Index() {
 
       if (document.visibilityState === "visible" && wasHiddenRef.current) {
         wasHiddenRef.current = false;
-        writeDashboardViewState({
-          pageIndex: pageIndexRef.current,
-          sortField,
-          sortDirection,
-          appliedFilterConfig,
-          pageSize,
-        });
-
-        // Soft recovery: refresh session then refetch current page data.
-        // (Avoids full page reload which can cause infinite loops or leave
-        //  the dashboard empty if the reload completes before auth initializes.)
-        console.log('[Index] Tab visible again — refreshing session and refetching data');
-        ensureValidSession(10000, true)
-          .catch(() => {})
-          .then(() => {
-            // Reset tracking so the fetch actually runs
-            initializedContextRef.current = '';
-            lastDataFetchAtRef.current = 0;
-            fetchPageRef.current?.({
-              page: typeof pageIndexRef.current === "number" ? pageIndexRef.current : 0,
-              showPageLoader: false,
-              includeCount: true,
-            });
-          });
+        requestReload("tab-return");
       }
     };
 
@@ -822,7 +858,7 @@ function Index() {
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [sortField, sortDirection, appliedFilterConfig]);
+  }, [sortField, sortDirection, appliedFilterConfig, pageSize]);
 
   // Auto-sync logic removed: manual refresh via `checkSyncAndLoad(true)` remains.
 
