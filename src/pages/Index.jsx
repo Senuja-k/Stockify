@@ -61,14 +61,17 @@ function isAuthError(error) {
 const DASHBOARD_VIEW_STATE_KEY = "dashboard-view-state";
 const RELOAD_PENDING_KEY = "reload-after-sync";
 
+// Global ref accessible from requestReload — set synchronously in checkSyncAndLoad
+let _isSyncingGlobal = false;
+
 /**
  * Request a full page reload. If a sync is running, defers the reload
  * until the sync completes (the sync-completion handler checks the flag).
  * A 5-second cooldown prevents infinite reload loops.
  */
 function requestReload(reason = "unknown") {
-  const isSyncing = useProductsStore.getState().isSyncing;
-  if (isSyncing) {
+  // Check both the synchronous module-level flag and the Zustand store
+  if (_isSyncingGlobal || useProductsStore.getState().isSyncing) {
     console.log(`[requestReload] sync in progress — deferring reload (reason: ${reason})`);
     try { sessionStorage.setItem(RELOAD_PENDING_KEY, reason); } catch {}
     return;
@@ -663,37 +666,56 @@ function Index() {
         if (forceSync) {
           setIsInitialLoading(true);
           setIsSyncing(true);
+          // Set module-level flag synchronously so requestReload() sees it
+          // immediately (React state + Zustand effect lag behind).
+          _isSyncingGlobal = true;
+          isSyncingRef.current = true;
+          try { useProductsStore.getState().setIsSyncing(true); } catch {}
 
           // Always use server-side sync (runs in Supabase Edge Function,
           // independent of the browser tab lifecycle).
           const payload = {
             storeIds: (storesToFetch || []).map((s) => s.id),
             organizationId: activeOrganizationId || null,
+            userId: userId || null,
           };
-          try {
-            const fnResp = await supabase.functions.invoke('sync-stores', {
-              body: JSON.stringify(payload),
-            });
-            if (fnResp?.error) {
-              console.error('[Index] server-side sync error:', fnResp.error);
-            } else {
-              console.log('[Index] server-side sync response', fnResp?.data);
-            }
-          } catch (err) {
-            console.error('[Index] server-side sync failed:', err);
+
+          const fnResp = await supabase.functions.invoke('sync-stores', {
+            body: payload,
+          });
+
+          if (fnResp?.error) {
+            console.error('[Index] server-side sync error:', fnResp.error);
+            const errMsg = fnResp.error?.message || fnResp.error?.context?.message || 'Server sync failed';
+            throw new Error(errMsg);
           }
 
-          // Read last-sync timestamp from DB
+          console.log('[Index] server-side sync response', fnResp?.data);
+
+          // Check individual store results
+          const syncResults = fnResp?.data?.results || [];
+          const failures = syncResults.filter((r) => !r.ok);
+          if (failures.length > 0) {
+            console.warn('[Index] some stores failed to sync:', failures);
+            if (syncResults.length > 0 && syncResults.every((r) => !r.ok)) {
+              const errDetails = failures.map((f) => typeof f.error === 'string' ? f.error : JSON.stringify(f.error)).join(', ');
+              throw new Error('Sync failed for all stores: ' + errDetails);
+            }
+          }
+
+          // Read last-sync timestamp from DB (only after successful sync)
           try {
             const storeIdsForQuery = (storesToFetch || []).map((s) => s.id);
             const dbLast = await getOrgLastSyncTime(
               activeOrganizationId || undefined,
               storeIdsForQuery,
             );
+            console.log('[Index] getOrgLastSyncTime returned:', dbLast);
             const ts = dbLast || new Date().toISOString();
             setLastSyncAt(ts);
             setPersistedLastSyncAt(ts);
           } catch (e) {
+            console.warn('[Index] failed to read last sync time:', e);
             const ts = new Date().toISOString();
             setLastSyncAt(ts);
             setPersistedLastSyncAt(ts);
@@ -726,6 +748,9 @@ function Index() {
       } finally {
         if (forceSync) {
           setIsSyncing(false);
+          _isSyncingGlobal = false;
+          isSyncingRef.current = false;
+          try { useProductsStore.getState().setIsSyncing(false); } catch {}
           // If a reload was deferred while syncing, do it now.
           try {
             const pending = sessionStorage.getItem(RELOAD_PENDING_KEY);

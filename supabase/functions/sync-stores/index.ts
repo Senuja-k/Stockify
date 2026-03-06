@@ -4,7 +4,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, x-client-info',
 };
 
 const supabaseUrl = Deno.env.get('SUPABASE_URL');
@@ -25,8 +25,50 @@ async function fetchAllProductsForStore(domain, adminToken) {
   let hasNext = true;
   let cursor = null;
 
-  const query = `query GetProducts($first:Int!,$after:String){products(first:$first,after:$after){pageInfo{hasNextPage,endCursor}edges{node{id,title,handle,productType,vendor,createdAt,updatedAt,images(first:1){edges{node{url,altText}}},variants(first:250){edges{node{id,title,sku,barcode,price,compareAtPrice}}}}}}`;
-
+  const query = `
+    query GetProducts($first: Int!, $after: String) {
+      products(first: $first, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        edges {
+          node {
+            id
+            title
+            handle
+            productType
+            vendor
+            status
+            createdAt
+            updatedAt
+            totalInventory
+            images(first: 1) {
+              edges {
+                node {
+                  url
+                  altText
+                }
+              }
+            }
+            variants(first: 250) {
+              edges {
+                node {
+                  id
+                  title
+                  sku
+                  barcode
+                  price
+                  compareAtPrice
+                  inventoryQuantity
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
   while (hasNext) {
     const variables = { first: 250 };
     if (cursor) variables.after = cursor;
@@ -95,9 +137,22 @@ serve(async (req) => {
     let body;
     try { body = JSON.parse(text); } catch (e) { return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }); }
 
-    const { storeIds = [], organizationId = null } = body || {};
+    const { storeIds = [], organizationId = null, userId = null } = body || {};
     if (!Array.isArray(storeIds) || storeIds.length === 0) {
       return new Response(JSON.stringify({ error: 'storeIds required' }), { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+    }
+
+    // Resolve userId: prefer body param, fall back to JWT
+    let resolvedUserId = userId;
+    if (!resolvedUserId) {
+      const authHeader = req.headers.get('Authorization');
+      if (authHeader) {
+        try {
+          const token = authHeader.replace('Bearer ', '');
+          const payload = JSON.parse(atob(token.split('.')[1]));
+          resolvedUserId = payload.sub || null;
+        } catch (_) {}
+      }
     }
 
     // Load stores including admin token
@@ -121,7 +176,7 @@ serve(async (req) => {
 
         // Prepare rows for upsert
         const rows = products.map((p) => ({
-          user_id: null,
+          user_id: resolvedUserId,
           organization_id: organizationId,
           store_id: store.id,
           shopify_product_id: String(p.productId || ''),
@@ -139,12 +194,20 @@ serve(async (req) => {
         }
 
         // Update sync status
-        await adminClient.from('shopify_store_sync_status').upsert({ store_id: store.id, last_synced_at: new Date().toISOString(), organization_id: organizationId }, { onConflict: 'store_id' });
+        const syncStatusRow = {
+          store_id: store.id,
+          last_synced_at: new Date().toISOString(),
+          organization_id: organizationId,
+        };
+        if (resolvedUserId) syncStatusRow.user_id = resolvedUserId;
+        const { error: syncStatusErr } = await adminClient.from('shopify_store_sync_status').upsert(syncStatusRow, { onConflict: 'store_id' });
+        if (syncStatusErr) console.error('[sync-stores] sync status upsert error:', syncStatusErr);
 
         results.push({ storeId: store.id, ok: true, imported: rows.length });
       } catch (err) {
         console.error('[sync-stores] store failed', store.id, err);
-        results.push({ storeId: store.id, ok: false, error: String(err).substring(0,500) });
+        const errMsg = err instanceof Error ? err.message : (typeof err === 'object' ? JSON.stringify(err) : String(err));
+        results.push({ storeId: store.id, ok: false, error: errMsg.substring(0,500) });
       }
     }
 
