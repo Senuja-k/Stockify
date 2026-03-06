@@ -1,0 +1,23 @@
+# shopify.app.toml — Shopify App Configuration
+# Docs: https://shopify.dev/docs/apps/tools/cli/configuration
+
+name = "Shopify Report"
+client_id = "7a670463fce65a3a8e8dfc101b23eedb"
+application_url = "https://stockify-virid.vercel.app"
+embedded = false
+
+[access_scopes]
+scopes = "write_products,read_products,write_inventory,read_inventory,read_orders,read_customers"
+
+[auth]
+redirect_urls = [
+  "https://stockify-virid.vercel.app/auth/shopify/callback",
+]
+
+[webhooks]
+api_version = "2024-07"
+
+  [webhooks.privacy_compliance]
+  customer_data_request_url = "https://gwqyjnnsamvunxdxpnmp.supabase.co/functions/v1/webhook-handler"
+  customer_deletion_url     = "https://gwqyjnnsamvunxdxpnmp.supabase.co/functions/v1/webhook-handler"
+  shop_deletion_url         = "https://gwqyjnnsamvunxdxpnmp.supabase.co/functions/v1/webhook-handler"
