@@ -379,7 +379,7 @@ export async function queryProductStats({
     if (d.productType) types.add(d.productType);
     storeSet.add(row.store_id);
 
-    const price = parseFloat(d.variantPrice || d.price || "0");
+    const price = parseFloat(d.variantPrice || d.price || d.variantData?.price || "0");
     if (!isNaN(price) && price > 0) {
       priceSum += price;
       priceCount += 1;
@@ -574,7 +574,8 @@ function formatRows(rows) {
       shopify_product_id: row.shopify_product_id,
       shopify_variant_id: row.shopify_variant_id,
       status: d.status || "UNKNOWN",
-      variantPrice: d.variantPrice || d.price,
+      variantPrice: d.variantPrice || d.price || d.variantData?.price,
+      compareAtPrice: d.compareAtPrice || d.variantData?.compareAtPrice,
       variants: [],
     };
   });

@@ -594,69 +594,6 @@ function Index() {
     pageIndexRef.current = pageIndex;
   }, [pageIndex]);
 
-  // -------------------------------------------------------------------
-  // Auto-sync: if stores exist but products have never been synced,
-  // automatically trigger the first sync so the user doesn't see an
-  // empty dashboard and have to figure out they need to click Refresh.
-  // -------------------------------------------------------------------
-  const autoSyncTriggeredRef = useRef(false);
-  useEffect(() => {
-    if (isInitialLoading || isLoadingPage || isSyncing) return;
-    if (!isAuthenticated || !userId) return;
-    if (storeIds.length === 0) return;
-    if (pageProducts.length > 0) return; // already have data
-    if (lastSyncAt) return; // has synced before — not a first-time issue
-    if (autoSyncTriggeredRef.current) return; // already triggered
-    if (error) return;
-    if (storesNeedingReconnect) return; // tokens invalid — reconnect needed, don't auto-sync
-
-    autoSyncTriggeredRef.current = true;
-    console.log('[Index] auto-sync: stores exist but never synced — triggering initial sync');
-    // Use checkSyncAndLoad with forceSync=true to run the server-side sync
-    syncCheckRef.current?.(true);
-  }, [isInitialLoading, isLoadingPage, isSyncing, isAuthenticated, userId, storeIds.length, pageProducts.length, lastSyncAt, error]);
-
-  // -------------------------------------------------------------------
-  // Safety net: if loading finished and we have previously-synced stores
-  // but no products, try a soft refetch. For never-synced stores the
-  // auto-sync effect above handles it instead.
-  // -------------------------------------------------------------------
-  const safetyNetRetryRef = useRef(0);
-  useEffect(() => {
-    if (isInitialLoading || isLoadingPage || isSyncing) return;
-    if (!isAuthenticated || !userId) return;
-    if (storeIds.length === 0) return;
-    if (pageProducts.length > 0) {
-      safetyNetRetryRef.current = 0;
-      return;
-    }
-    if (error) return;
-    // Don't run safety net if stores have never been synced — auto-sync handles that
-    if (!lastSyncAt) return;
-
-    safetyNetRetryRef.current += 1;
-    const attempt = safetyNetRetryRef.current;
-    console.warn('[Index] safety-net: 0 products with', storeIds.length, 'synced stores — attempt', attempt);
-
-    if (attempt >= 3) {
-      console.warn('[Index] safety-net: giving up after', attempt, 'attempts');
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      ensureValidSession(8000, true)
-        .catch(() => {})
-        .then(() => {
-          fetchPageRef.current?.({
-            page: typeof pageIndexRef.current === 'number' ? pageIndexRef.current : 0,
-            showPageLoader: false,
-            includeCount: true,
-          });
-        });
-    }, 500 * attempt);
-    return () => clearTimeout(timer);
-  }, [isInitialLoading, isLoadingPage, isSyncing, isAuthenticated, userId, storeIds.length, pageProducts.length, lastSyncAt, error]);
-
   // ✅ Fetch org-level last sync time from DB so all users in the same org
   //    see the same "Last sync" timestamp.
   useEffect(() => {
@@ -1088,62 +1025,7 @@ function Index() {
       console.log('[Index] export: columnsToExport', columnsToExport);
       console.log('[Index] export: sample', withNames[0]);
 
-      // Attempt server-side export via Supabase Edge Function for large exports.
-      try {
-        const payload = {
-          storeIds,
-          organizationId: activeOrganizationId || null,
-          filterConfig: appliedFilterConfig,
-          selectedColumns: columnsToExport,
-        };
-        // Try using the Supabase Functions API (supabase client available globally)
-        // If it fails, fall back to client-side export.
-        if (typeof supabase !== 'undefined' && supabase.functions && supabase.functions.invoke) {
-          try {
-            const fnResp = await supabase.functions.invoke('export-products', { body: JSON.stringify(payload) });
-            if (fnResp.error) throw fnResp.error;
-
-            // fnResp.data may be ArrayBuffer / string depending on client; handle both
-            let blob;
-            if (fnResp.data instanceof ArrayBuffer) {
-              blob = new Blob([fnResp.data], { type: 'text/csv' });
-            } else if (typeof fnResp.data === 'string') {
-              blob = new Blob([fnResp.data], { type: 'text/csv' });
-            } else if (fnResp.arrayBuffer) {
-              const ab = await fnResp.arrayBuffer();
-              blob = new Blob([ab], { type: 'text/csv' });
-            }
-
-            if (blob) {
-              const url = URL.createObjectURL(blob);
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = 'shopify-products-export.csv';
-              document.body.appendChild(a);
-              a.click();
-              a.remove();
-              URL.revokeObjectURL(url);
-              toast({ title: 'Export started', description: 'Your export is downloading.' });
-            } else {
-              // Fallback to client-side export
-              exportToExcel(withNames, columnsToExport, 'shopify-products');
-            }
-
-            // end server export
-            clearTimeout(fallbackId);
-            setIsExporting(false);
-            return;
-          } catch (fnErr) {
-            console.warn('[Index] server-side export failed, falling back to client export:', fnErr);
-            // continue to client-side export
-          }
-        }
-
-      } catch (e) {
-        console.warn('[Index] server export attempt error', e);
-      }
-
-      // client-side fallback
+      // Client-side Excel export
       exportToExcel(withNames, columnsToExport, "shopify-products");
       toast({
         title: "Export successful",

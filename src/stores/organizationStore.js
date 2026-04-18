@@ -88,20 +88,9 @@ export const useOrganization = create()(
         console.log('[organizationStore] setActiveOrganization called', { currentOrgId, organizationId });
         set({ activeOrganizationId: organizationId });
 
-        // The Index page will detect the org change and trigger a reload
-        // (sync-guarded via requestReload in Index.jsx).
-        // Load stores eagerly so data is ready after the reload.
+        // Full page reload when switching orgs so all data is fetched fresh
         if (currentOrgId !== organizationId) {
-          try {
-            const { useStoreManagement } = await import('./storeManagement');
-            if (organizationId) {
-              useStoreManagement.getState().loadStores({ organizationId, force: true });
-            } else {
-              useStoreManagement.getState().clearStores();
-            }
-          } catch (e) {
-            console.warn('[organizationStore] failed to pre-load stores for new org', e);
-          }
+          window.location.reload();
         }
       },
 
