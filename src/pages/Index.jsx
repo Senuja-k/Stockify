@@ -1214,23 +1214,29 @@ function Index() {
                   </p>
                 ) : null}
               </div>
-            ) : storeIds.length > 0 && !lastSyncAt && pageProducts.length === 0 ? (
+            ) : storeIds.length > 0 && !lastSyncAt && pageProducts.length === 0 && !isSyncing ? (
               <div className="glass-card rounded-lg p-12 text-center">
-                <Loader2 className="h-12 w-12 mx-auto text-primary mb-4 animate-spin" />
+                <Store className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
                 <p className="font-medium mb-2">
-                  {isSyncing ? "Syncing your products..." : "Preparing initial sync..."}
+                  No products synced yet
                 </p>
                 <p className="text-muted-foreground text-sm mb-4">
+                  Click <strong>Refresh</strong> to sync products from your connected stores.
+                </p>
+                <button
+                  onClick={() => syncCheckRef.current?.(true)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-sm font-medium"
+                >
+                  Sync now
+                </button>
+              </div>
+            ) : storeIds.length > 0 && isSyncing && pageProducts.length === 0 ? (
+              <div className="glass-card rounded-lg p-12 text-center">
+                <Loader2 className="h-12 w-12 mx-auto text-primary mb-4 animate-spin" />
+                <p className="font-medium mb-2">Syncing your products...</p>
+                <p className="text-muted-foreground text-sm">
                   This may take a moment for stores with many products.
                 </p>
-                {!isSyncing && (
-                  <button
-                    onClick={() => syncCheckRef.current?.(true)}
-                    className="text-primary hover:underline text-sm font-medium"
-                  >
-                    Start sync now
-                  </button>
-                )}
               </div>
             ) : (
               <div className="overflow-x-auto rounded-lg">
