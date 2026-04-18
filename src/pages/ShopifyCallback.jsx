@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { exchangeCodeForToken, saveShopifyStore } from '../lib/shopify-oauth';
-import { supabase } from '../lib/supabase';
+import { supabase, ensureValidSession } from '../lib/supabase';
 import { useStoreManagement } from '../stores/storeManagement';
 import { useOrganization } from '../stores/organizationStore';
+import { useAuth } from '../stores/authStore.jsx';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../components/ui/card';
 import { Loader2 } from 'lucide-react';
 
@@ -12,6 +13,25 @@ import { Loader2 } from 'lucide-react';
 // more than once per page load.
 const _processedCodes = new Set();
 
+/**
+ * Wait for Zustand persist stores to hydrate (org + auth).
+ * Polls getState() every 50ms up to maxWaitMs.
+ */
+async function waitForStoreHydration(maxWaitMs = 3000) {
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const orgId = useOrganization.getState().activeOrganizationId;
+    const user = useAuth.getState().user;
+    if (orgId && user) return { orgId, user };
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  // Return whatever we have after timeout
+  return {
+    orgId: useOrganization.getState().activeOrganizationId,
+    user: useAuth.getState().user,
+  };
+}
+
 export default function ShopifyCallback() {
   const OAUTH_CODE_PREFIX = 'shopify_oauth_code_processed:';
   const navigate = useNavigate();
@@ -19,7 +39,6 @@ export default function ShopifyCallback() {
   const [status, setStatus] = useState('processing');
   const [error, setError] = useState(null);
   const addStore = useStoreManagement((state) => state.addStore);
-  const activeOrganizationId = useOrganization((state) => state.activeOrganizationId);
   // Guard against React 18 Strict Mode double-invocation (code is single-use)
   const hasRun = useRef(false);
 
@@ -60,6 +79,19 @@ export default function ShopifyCallback() {
         // Remove OAuth params from URL immediately to reduce accidental reprocessing on refresh/back.
         window.history.replaceState({}, document.title, window.location.pathname);
 
+        // Wait for Zustand persist stores (auth + org) to hydrate after the
+        // full page reload caused by the OAuth redirect.
+        console.log('[ShopifyCallback] waiting for store hydration...');
+        const { orgId: hydratedOrgId, user: hydratedUser } = await waitForStoreHydration(3000);
+        console.log('[ShopifyCallback] hydration result', { hydratedOrgId, hydratedUser: !!hydratedUser });
+
+        // Ensure Supabase session is valid (may have expired during OAuth redirect)
+        try {
+          await ensureValidSession(8000, true);
+        } catch (e) {
+          console.warn('[ShopifyCallback] session refresh warning:', e);
+        }
+
         // Get current user
         const {
           data,
@@ -70,6 +102,31 @@ export default function ShopifyCallback() {
           throw new Error('Not authenticated');
         }
 
+        // If auth store doesn't have the user yet, set it now
+        if (!useAuth.getState().user) {
+          useAuth.getState().setUser({
+            id: data.user.id,
+            email: data.user.email || '',
+            name: data.user.user_metadata?.name || data.user.email?.split('@')[0] || 'User',
+          });
+        }
+
+        // If org store doesn't have an active org, initialize organizations
+        let activeOrgId = useOrganization.getState().activeOrganizationId;
+        if (!activeOrgId) {
+          console.log('[ShopifyCallback] no active org — loading organizations...');
+          try {
+            await useOrganization.getState().loadOrganizations({ force: true });
+            activeOrgId = useOrganization.getState().activeOrganizationId;
+          } catch (e) {
+            console.warn('[ShopifyCallback] loadOrganizations failed:', e);
+          }
+        }
+
+        if (!activeOrgId) {
+          throw new Error('No active organization found. Please create an organization first.');
+        }
+
         // Exchange code for access token (Admin API token)
         const shopifyStore = await exchangeCodeForToken(shop, code);
         if (!shopifyStore) {
@@ -77,7 +134,7 @@ export default function ShopifyCallback() {
         }
 
         // Save store connection to database for OAuth tracking
-        const saved = await saveShopifyStore(data.user.id, shop, shopifyStore.accessToken, activeOrganizationId || undefined);
+        const saved = await saveShopifyStore(data.user.id, shop, shopifyStore.accessToken, activeOrgId);
         if (!saved) {
           throw new Error('Failed to save store connection');
         }
@@ -85,6 +142,12 @@ export default function ShopifyCallback() {
         // Check if this is coming from "Add Store" dialog
         const pendingStoreJson = sessionStorage.getItem('pendingStore');
         
+        // Normalize shop domain for fallback
+        let normalizedShop = shop.toLowerCase();
+        if (!normalizedShop.includes('.myshopify.com')) {
+          normalizedShop = `${normalizedShop}.myshopify.com`;
+        }
+        normalizedShop = normalizedShop.replace(/^https:\/\//, '');
         
         if (pendingStoreJson) {
           try {
@@ -112,13 +175,52 @@ export default function ShopifyCallback() {
             throw err; // Re-throw so we catch it in the outer catch block
           }
         } else {
-          console.warn('No pending store found in session storage');
+          // Fallback: pendingStore missing (sessionStorage cleared during redirect).
+          // Create the store entry from the OAuth data so the dashboard can find it.
+          console.warn('[ShopifyCallback] No pending store found — creating from OAuth data');
+          try {
+            const storeName = normalizedShop.replace('.myshopify.com', '');
+            await addStore({
+              name: storeName,
+              domain: normalizedShop,
+              adminToken: shopifyStore.accessToken,
+            });
+          } catch (err) {
+            console.error('[ShopifyCallback] Fallback addStore failed:', err);
+            throw err;
+          }
+        }
+
+        // Force-reload stores from DB so dashboard has fresh data
+        try {
+          await useStoreManagement.getState().loadStores({ organizationId: activeOrgId, force: true });
+        } catch (e) {
+          console.warn('[ShopifyCallback] post-add loadStores failed:', e);
+        }
+
+        // Trigger an initial product sync so the dashboard isn't empty
+        try {
+          const latestStores = useStoreManagement.getState().stores || [];
+          const storeIds = latestStores.map((s) => s.id);
+          if (storeIds.length > 0) {
+            console.log('[ShopifyCallback] triggering initial sync for', storeIds.length, 'stores');
+            supabase.functions.invoke('sync-stores', {
+              body: {
+                storeIds,
+                organizationId: activeOrgId,
+                userId: data.user.id,
+              },
+            }).catch((e) => console.warn('[ShopifyCallback] background sync error:', e));
+          }
+        } catch (e) {
+          console.warn('[ShopifyCallback] initial sync trigger failed:', e);
         }
 
         setStatus('success');
-        // Redirect to dashboard after 2 seconds
+        // Use full page reload instead of navigate to ensure clean state
+        // (all stores, auth, org are loaded fresh)
         setTimeout(() => {
-          navigate('/');
+          window.location.href = '/';
         }, 2000);
       } catch (err) {
         console.error('OAuth callback error:', err);
@@ -141,7 +243,7 @@ export default function ShopifyCallback() {
     };
 
     handleCallback();
-  }, [searchParams, navigate, addStore]);
+  }, [searchParams, navigate, addStore]); // addStore is stable (Zustand selector)
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-gray-50 px-4">

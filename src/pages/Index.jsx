@@ -1,6 +1,6 @@
 ﻿import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useProductsStore } from "@/stores/productsStore";
-import { Package, Banknote, Building2, Tags, Store } from "lucide-react";
+import { Package, Banknote, Building2, Tags, Store, Loader2, AlertTriangle } from "lucide-react";
 import { exportToExcel } from "@/lib/exportToExcel";
 import { DashboardHeader } from "@/components/dashboard/DashboardHeader";
 import { StatsCard } from "@/components/dashboard/StatsCard";
@@ -20,6 +20,7 @@ import { getOrgLastSyncTime } from "@/lib/shopifySync";
 import { useOrganization } from "@/stores/organizationStore";
 import { useAuth } from "@/stores/authStore.jsx";
 import { useLocation } from "react-router-dom";
+import { getShopifyAuthUrl } from '@/lib/shopify-oauth';
 import { useProductsPageCacheStore } from "@/stores/productsPageCacheStore";
 
 // Helper function to check if an error is an AbortError
@@ -153,6 +154,8 @@ function Index() {
   const [isInitialLoading, setIsInitialLoading] = useState(true);
   const [isLoadingPage, setIsLoadingPage] = useState(false);
   const [error, setError] = useState(null);
+  // Stores whose tokens are invalid (401 from Shopify API)
+  const [storesNeedingReconnect, setStoresNeedingReconnect] = useState(false);
 
   // Sync metadata — org-level (fetched from DB, not per-user localStorage)
   const [lastSyncAt, setLastSyncAt] = useState(null);
@@ -445,16 +448,18 @@ function Index() {
         if (reqId !== pageReqIdRef.current) return; // ✅ ignore stale response
 
         // ✅ RLS ghost detection: if we have stores but the query returned 0
-        // rows, the session token may have expired (Supabase RLS silently
-        // returns empty sets instead of errors for invalid JWTs). Force a
-        // session refresh and retry once.
+        // rows, AND we have evidence of a previous sync, the session token
+        // may have expired (Supabase RLS silently returns empty sets instead
+        // of errors for invalid JWTs). Skip this check if stores have never
+        // been synced — 0 products is expected then.
         if (
           pageResult.data.length === 0 &&
           effectiveStoreIds.length > 0 &&
-          !opts._isRetryAfterRefresh
+          !opts._isRetryAfterRefresh &&
+          lastSyncAt // Only suspect RLS ghost if there was a previous sync
         ) {
           console.warn(
-            "[Index] 0 products returned despite having stores — possible expired session (RLS ghost). Refreshing session and retrying..."
+            "[Index] 0 products returned despite having synced stores — possible expired session (RLS ghost). Refreshing session and retrying..."
           );
           const refreshOk = await refreshSessionSilently(10000);
           if (refreshOk) {
@@ -590,12 +595,35 @@ function Index() {
   }, [pageIndex]);
 
   // -------------------------------------------------------------------
-  // Safety net: if loading finished but we have stores and no products,
-  // try a soft refetch once; if still empty, request a full reload.
+  // Auto-sync: if stores exist but products have never been synced,
+  // automatically trigger the first sync so the user doesn't see an
+  // empty dashboard and have to figure out they need to click Refresh.
+  // -------------------------------------------------------------------
+  const autoSyncTriggeredRef = useRef(false);
+  useEffect(() => {
+    if (isInitialLoading || isLoadingPage || isSyncing) return;
+    if (!isAuthenticated || !userId) return;
+    if (storeIds.length === 0) return;
+    if (pageProducts.length > 0) return; // already have data
+    if (lastSyncAt) return; // has synced before — not a first-time issue
+    if (autoSyncTriggeredRef.current) return; // already triggered
+    if (error) return;
+    if (storesNeedingReconnect) return; // tokens invalid — reconnect needed, don't auto-sync
+
+    autoSyncTriggeredRef.current = true;
+    console.log('[Index] auto-sync: stores exist but never synced — triggering initial sync');
+    // Use checkSyncAndLoad with forceSync=true to run the server-side sync
+    syncCheckRef.current?.(true);
+  }, [isInitialLoading, isLoadingPage, isSyncing, isAuthenticated, userId, storeIds.length, pageProducts.length, lastSyncAt, error]);
+
+  // -------------------------------------------------------------------
+  // Safety net: if loading finished and we have previously-synced stores
+  // but no products, try a soft refetch. For never-synced stores the
+  // auto-sync effect above handles it instead.
   // -------------------------------------------------------------------
   const safetyNetRetryRef = useRef(0);
   useEffect(() => {
-    if (isInitialLoading || isLoadingPage) return;
+    if (isInitialLoading || isLoadingPage || isSyncing) return;
     if (!isAuthenticated || !userId) return;
     if (storeIds.length === 0) return;
     if (pageProducts.length > 0) {
@@ -603,13 +631,15 @@ function Index() {
       return;
     }
     if (error) return;
+    // Don't run safety net if stores have never been synced — auto-sync handles that
+    if (!lastSyncAt) return;
 
     safetyNetRetryRef.current += 1;
     const attempt = safetyNetRetryRef.current;
-    console.warn('[Index] safety-net: 0 products with', storeIds.length, 'stores — attempt', attempt);
+    console.warn('[Index] safety-net: 0 products with', storeIds.length, 'synced stores — attempt', attempt);
 
-    if (attempt >= 2) {
-      requestReload("safety-net-empty");
+    if (attempt >= 3) {
+      console.warn('[Index] safety-net: giving up after', attempt, 'attempts');
       return;
     }
 
@@ -623,9 +653,9 @@ function Index() {
             includeCount: true,
           });
         });
-    }, 500);
+    }, 500 * attempt);
     return () => clearTimeout(timer);
-  }, [isInitialLoading, isLoadingPage, isAuthenticated, userId, storeIds.length, pageProducts.length, error]);
+  }, [isInitialLoading, isLoadingPage, isSyncing, isAuthenticated, userId, storeIds.length, pageProducts.length, lastSyncAt, error]);
 
   // ✅ Fetch org-level last sync time from DB so all users in the same org
   //    see the same "Last sync" timestamp.
@@ -735,15 +765,29 @@ function Index() {
       } catch (err) {
         if (!isAbortError(err)) {
           console.error("[Index] checkSyncAndLoad error:", err);
+          const errMsg = err instanceof Error ? err.message : "Failed to load";
+
+          // Detect Shopify 401 token errors — these mean the store(s) need
+          // to be reconnected via OAuth, not just retried.
+          const isTokenError = /401|Invalid API key|access token|unrecognized login/i.test(errMsg);
+
+          if (isTokenError) {
+            setStoresNeedingReconnect(true);
+            setError(null); // Don't show generic error, show reconnect UI instead
+          } else {
+            setStoresNeedingReconnect(false);
+            setError(errMsg);
+          }
+
           if (forceSync) {
             toast({
               title: "Sync failed",
-              description:
-                err instanceof Error ? err.message : "Could not sync stores.",
+              description: isTokenError
+                ? "Store access tokens are invalid. Please reconnect your stores."
+                : (err instanceof Error ? err.message : "Could not sync stores."),
               variant: "destructive",
             });
           }
-          setError(err instanceof Error ? err.message : "Failed to load");
         }
       } finally {
         if (forceSync) {
@@ -1188,7 +1232,7 @@ function Index() {
                 />
                 <StatsCard
                   title="Connected Stores"
-                  value={stats.totalStores}
+                  value={Math.max(stats.totalStores, storeIds.length)}
                   subtitle="Active"
                   icon={<Store className="h-5 w-5 text-primary" />}
                   className="w-full"
@@ -1224,6 +1268,43 @@ function Index() {
                 <Skeleton className="h-[60px] rounded-lg w-full" />
                 <Skeleton className="h-[400px] sm:h-[450px] md:h-[500px] rounded-lg w-full" />
               </>
+            ) : storesNeedingReconnect ? (
+              <div className="glass-card rounded-lg p-12 text-center">
+                <AlertTriangle className="h-12 w-12 mx-auto text-amber-500 mb-4" />
+                <p className="font-medium mb-2">
+                  Store access tokens expired
+                </p>
+                <p className="text-muted-foreground text-sm mb-4">
+                  Your Shopify store connections need to be re-authorized.
+                  Please reconnect each store to refresh the access tokens.
+                </p>
+                <div className="flex flex-col items-center gap-3">
+                  {(storesToFetch || []).map((store) => {
+                    const handleReconnect = () => {
+                      let shopDomain = (store.domain || '').toLowerCase();
+                      if (!shopDomain.includes('.myshopify.com')) {
+                        shopDomain = `${shopDomain}.myshopify.com`;
+                      }
+                      // Save pending store info so the callback can update the existing store
+                      sessionStorage.setItem('pendingStore', JSON.stringify({
+                        name: store.name,
+                        domain: shopDomain,
+                      }));
+                      window.location.href = getShopifyAuthUrl(shopDomain);
+                    };
+                    return (
+                      <button
+                        key={store.id}
+                        onClick={handleReconnect}
+                        className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 text-sm font-medium"
+                      >
+                        <Store className="h-4 w-4" />
+                        Reconnect {store.name || store.domain}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             ) : error ? (
               <div className="glass-card rounded-lg p-12 text-center">
                 <p className="text-destructive font-medium mb-2">
@@ -1250,6 +1331,24 @@ function Index() {
                     {String(storesError)}
                   </p>
                 ) : null}
+              </div>
+            ) : storeIds.length > 0 && !lastSyncAt && pageProducts.length === 0 ? (
+              <div className="glass-card rounded-lg p-12 text-center">
+                <Loader2 className="h-12 w-12 mx-auto text-primary mb-4 animate-spin" />
+                <p className="font-medium mb-2">
+                  {isSyncing ? "Syncing your products..." : "Preparing initial sync..."}
+                </p>
+                <p className="text-muted-foreground text-sm mb-4">
+                  This may take a moment for stores with many products.
+                </p>
+                {!isSyncing && (
+                  <button
+                    onClick={() => syncCheckRef.current?.(true)}
+                    className="text-primary hover:underline text-sm font-medium"
+                  >
+                    Start sync now
+                  </button>
+                )}
               </div>
             ) : (
               <div className="overflow-x-auto rounded-lg">

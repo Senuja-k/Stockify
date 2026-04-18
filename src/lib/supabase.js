@@ -171,10 +171,31 @@ export async function getUserWithTimeout(timeoutMs = AUTH_TIMEOUT_MS) {
 
 /**
  * Attempts to refresh the session silently.
+ * Uses auth.getSession() first (triggers auto-refresh via stored refresh token),
+ * then falls back to explicit auth.refreshSession() if needed.
  * Returns true if session was refreshed successfully, false otherwise.
  */
 export async function refreshSessionSilently(timeoutMs = AUTH_TIMEOUT_MS) {
   
+  try {
+    // Try getSession first — it reads from storage and auto-refreshes
+    // if the access token is expired but refresh token is valid.
+    // This is typically faster and more reliable than auth.refreshSession().
+    const getSessionResult = await withTimeout(
+      auth.getSession(),
+      Math.min(timeoutMs, 8000),
+      "getSession-refresh",
+    );
+
+    if (getSessionResult?.data?.session?.access_token) {
+      
+      return true;
+    }
+  } catch (e) {
+    // getSession failed/timed out — fall through to explicit refresh
+    console.debug("[refreshSessionSilently] getSession failed, trying explicit refresh:", e?.message || e);
+  }
+
   try {
     const { data, error } = await withTimeout(
       auth.refreshSession(),

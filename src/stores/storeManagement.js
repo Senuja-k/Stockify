@@ -57,9 +57,36 @@ export const useStoreManagement = create()(
 
           
           console.log('[storeManagement] fetching stores for org', organizationId, 'user', user?.id);
-          const stores = await getStores(user.id, organizationId);
+          let stores = await getStores(user.id, organizationId);
           if (stores === null) {
             return;
+          }
+
+          // ✅ RLS ghost detection: if we had stores locally but the DB returned
+          // empty, the JWT may have expired (Supabase RLS silently returns empty
+          // sets for invalid JWTs). Refresh the session and retry once.
+          const localStores = get().stores || [];
+          if (stores.length === 0 && localStores.length > 0) {
+            console.warn('[storeManagement] RLS ghost detected: had', localStores.length, 'stores locally but DB returned 0. Refreshing session and retrying...');
+            try {
+              const { refreshSessionSilently } = await import('@/lib/supabase');
+              const refreshed = await refreshSessionSilently(8000);
+              if (refreshed) {
+                const retryStores = await getStores(user.id, organizationId);
+                if (retryStores !== null && retryStores.length > 0) {
+                  console.log('[storeManagement] RLS ghost retry succeeded:', retryStores.length, 'stores');
+                  stores = retryStores;
+                } else if (retryStores !== null && retryStores.length === 0) {
+                  console.warn('[storeManagement] RLS ghost retry also returned 0 — stores may have been legitimately deleted');
+                }
+              } else {
+                console.warn('[storeManagement] session refresh failed — keeping local stores');
+                return;
+              }
+            } catch (retryErr) {
+              console.error('[storeManagement] RLS ghost retry error:', retryErr);
+              return;
+            }
           }
           
 
