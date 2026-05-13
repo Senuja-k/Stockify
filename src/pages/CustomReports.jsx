@@ -18,6 +18,7 @@ import { Plus, Copy, Trash2, AlertCircle, Loader2, Edit } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { SimpleHeader } from '../components/dashboard/SimpleHeader';
 import { useOrganization } from '../stores/organizationStore';
+import { useCustomColumnsStore } from '../stores/customColumnsStore';
 
 export function CustomReports() {
   const navigate = useNavigate();
@@ -26,6 +27,7 @@ export function CustomReports() {
   const { reports, createReport, deleteReport, loadReports } = useReportManagement();
   const { stores, loadStores } = useStoreManagement();
   const activeOrganizationId = useOrganization((state) => state.activeOrganizationId);
+  const { customColumns, loadCustomColumns } = useCustomColumnsStore();
 
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [reportName, setReportName] = useState('');
@@ -138,7 +140,11 @@ export function CustomReports() {
         }
 
         const detected = detectProductFields(products);
-        const columnKeys = detected.map((col) => col.key);
+        // Load custom columns so they appear in the column picker
+        if (activeOrganizationId) await loadCustomColumns(activeOrganizationId);
+        const salesKeys = ['__sales_qty__', '__sales_amount__'];
+        const customKeys = useCustomColumnsStore.getState().customColumns.map((cc) => `__custom__${cc.id}`);
+        const columnKeys = [...detected.map((col) => col.key), ...salesKeys, ...customKeys];
         setAvailableColumns(columnKeys);
         // Auto-select all columns by default
         setSelectedColumns(columnKeys);

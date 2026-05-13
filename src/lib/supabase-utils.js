@@ -128,9 +128,18 @@ export async function getStores(userId, organizationId) {
 
 export async function updateStoreInSupabase(userId, organizationId, storeId, updates) {
   try {
+    // Map camelCase keys to snake_case DB columns
+    const dbUpdates = {};
+    if (updates.adminToken   !== undefined) dbUpdates.admin_token       = updates.adminToken;
+    if (updates.admin_token  !== undefined) dbUpdates.admin_token       = updates.admin_token;
+    if (updates.storefrontToken !== undefined) dbUpdates.storefront_token = updates.storefrontToken;
+    if (updates.storefront_token !== undefined) dbUpdates.storefront_token = updates.storefront_token;
+    if (updates.name         !== undefined) dbUpdates.name              = updates.name;
+    if (updates.domain       !== undefined) dbUpdates.domain            = updates.domain;
+
     const { error } = await supabase
       .from('stores')
-      .update({ ...updates, user_id: userId, organization_id: organizationId })
+      .update(dbUpdates)
       .eq('id', storeId)
       .eq('organization_id', organizationId);
 
@@ -179,8 +188,15 @@ export async function deleteStoreFromSupabase(userId, organizationId, storeId) {
 export async function saveReport(userId, organizationId, report) {
   try {
     // Map camelCase to snake_case for database
-    const { createdAt, updatedAt, selectedColumns, filterConfig, shareLink, storeId, storeName, organizationId: _orgId, ...reportData } = report;
+    // codeStatOrder has no dedicated column — embed it inside the filters JSONB
+    const { createdAt, updatedAt, selectedColumns, filterConfig, shareLink, storeId, storeName, organizationId: _orgId, codeStatOrder, customCode, ...reportData } = report;
     
+    const filtersPayload = {
+      ...(filterConfig || {}),
+      ...(Array.isArray(codeStatOrder) && codeStatOrder.length ? { __codeStatOrder: codeStatOrder } : {}),
+      ...(customCode ? { __customCode: customCode } : {}),
+    };
+
     const { error } = await supabase
       .from('reports')
       .upsert({ 
@@ -188,7 +204,7 @@ export async function saveReport(userId, organizationId, report) {
         user_id: userId,
         organization_id: organizationId,
         selected_columns: selectedColumns,
-        filters: filterConfig, // Maps filterConfig to 'filters' column
+        filters: filtersPayload, // Maps filterConfig + codeStatOrder to 'filters' column
         share_link: shareLink,
         store_id: storeId,
         store_name: storeName,
@@ -221,17 +237,23 @@ export async function getReports(userId, organizationId) {
     if (error) throw error;
     
     // Map snake_case back to camelCase
-    return (data || []).map(report => ({
-      ...report,
-      selectedColumns: report.selected_columns || [],
-      filterConfig: report.filters || { items: [] }, // Maps 'filters' column to filterConfig
-      createdAt: report.created_at,
-      updatedAt: report.updated_at,
-      storeId: report.store_id,
-      storeName: report.store_name,
-      shareLink: report.share_link,
-      organizationId: report.organization_id,
-    }));
+    return (data || []).map(report => {
+      const rawFilters = report.filters || {};
+      const { __codeStatOrder, __customCode, ...filterItems } = rawFilters;
+      return {
+        ...report,
+        selectedColumns: report.selected_columns || [],
+        filterConfig: filterItems,
+        codeStatOrder: Array.isArray(__codeStatOrder) ? __codeStatOrder : null,
+        customCode: __customCode || null,
+        createdAt: report.created_at,
+        updatedAt: report.updated_at,
+        storeId: report.store_id,
+        storeName: report.store_name,
+        shareLink: report.share_link,
+        organizationId: report.organization_id,
+      };
+    });
   } catch (error) {
     console.error('Error getting reports:', error);
     return [];
@@ -259,10 +281,14 @@ export async function getReportByShareLink(shareLink) {
     
     
     // Map snake_case back to camelCase
+    const rawFilters = data.filters || {};
+    const { __codeStatOrder, __customCode, ...filterItems } = rawFilters;
     return {
       ...data,
       selectedColumns: data.selected_columns || [],
-      filterConfig: data.filters || { items: [] }, // Maps 'filters' column to filterConfig
+      filterConfig: filterItems,
+      codeStatOrder: Array.isArray(__codeStatOrder) ? __codeStatOrder : null,
+      customCode: __customCode || null,
       createdAt: data.created_at,
       updatedAt: data.updated_at,
       storeId: data.store_id,
@@ -547,3 +573,66 @@ export async function removeOrganizationMember(organizationId, userId) {
 // - deleteMissingCachedProducts ? markDeletedProducts (soft delete)
 // - getStoreSyncStatus ? getSyncStatus
 // - upsertStoreSyncStatus ? updateSyncStatus
+
+// ============= CUSTOM COLUMNS =============
+
+export async function getCustomColumns(userId, organizationId) {
+  let query = supabase
+    .from('custom_columns')
+    .select('*')
+    .eq('user_id', userId)
+    .order('position', { ascending: true });
+
+  if (organizationId) {
+    query = query.eq('organization_id', organizationId);
+  }
+
+  const { data, error } = await query;
+  if (error) throw error;
+
+  return (data || []).map((col) => ({
+    id: col.id,
+    userId: col.user_id,
+    organizationId: col.organization_id,
+    name: col.name,
+    formula: col.formula,
+    position: col.position,
+    createdAt: col.created_at,
+  }));
+}
+
+export async function saveCustomColumn(userId, organizationId, { name, formula, position }) {
+  const { data, error } = await supabase
+    .from('custom_columns')
+    .insert({
+      user_id: userId,
+      organization_id: organizationId || null,
+      name,
+      formula,
+      position: position ?? 0,
+    })
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  return {
+    id: data.id,
+    userId: data.user_id,
+    organizationId: data.organization_id,
+    name: data.name,
+    formula: data.formula,
+    position: data.position,
+    createdAt: data.created_at,
+  };
+}
+
+export async function deleteCustomColumn(columnId, userId) {
+  const { error } = await supabase
+    .from('custom_columns')
+    .delete()
+    .eq('id', columnId)
+    .eq('user_id', userId);
+
+  if (error) throw error;
+}

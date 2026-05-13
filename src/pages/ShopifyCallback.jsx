@@ -38,7 +38,7 @@ export default function ShopifyCallback() {
   const [searchParams] = useSearchParams();
   const [status, setStatus] = useState('processing');
   const [error, setError] = useState(null);
-  const addStore = useStoreManagement((state) => state.addStore);
+  const addStore = useStoreManagement((state) => state.addStore); // kept for dep array stability
   // Guard against React 18 Strict Mode double-invocation (code is single-use)
   const hasRun = useRef(false);
 
@@ -139,6 +139,9 @@ export default function ShopifyCallback() {
           throw new Error('Failed to save store connection');
         }
 
+        // Ensure stores are loaded from DB before we try to find an existing one
+        await useStoreManagement.getState().loadStores({ organizationId: activeOrgId, force: true });
+
         // Check if this is coming from "Add Store" dialog
         const pendingStoreJson = sessionStorage.getItem('pendingStore');
         
@@ -159,14 +162,24 @@ export default function ShopifyCallback() {
               normalizedDomain = `${normalizedDomain}.myshopify.com`;
             }
             normalizedDomain = normalizedDomain.replace(/^https:\/\//, '');
-            
-            
-            // Add the store with only admin token from OAuth
-            const result = await addStore({
-              name: pendingStore.name,
-              domain: normalizedDomain,
-              adminToken: shopifyStore.accessToken, // Admin token from OAuth exchange
-            });
+
+            // If a store with this domain already exists, update its token instead
+            // of creating a new record (which would orphan all synced products).
+            const { updateStore, addStore: _addStore, stores: currentStores } = useStoreManagement.getState();
+            const existingStore = currentStores.find(
+              (s) => s.domain?.toLowerCase().replace(/^https:\/\//, '') === normalizedDomain
+            );
+
+            if (existingStore) {
+              console.log('[ShopifyCallback] Updating existing store name + token for', normalizedDomain);
+              await updateStore(existingStore.id, { adminToken: shopifyStore.accessToken, name: pendingStore.name });
+            } else {
+              await _addStore({
+                name: pendingStore.name,
+                domain: normalizedDomain,
+                adminToken: shopifyStore.accessToken,
+              });
+            }
             
             // Clear pending store
             sessionStorage.removeItem('pendingStore');
@@ -176,17 +189,27 @@ export default function ShopifyCallback() {
           }
         } else {
           // Fallback: pendingStore missing (sessionStorage cleared during redirect).
-          // Create the store entry from the OAuth data so the dashboard can find it.
-          console.warn('[ShopifyCallback] No pending store found — creating from OAuth data');
+          // Create or update the store entry from the OAuth data.
+          console.warn('[ShopifyCallback] No pending store found — upserting from OAuth data');
           try {
             const storeName = normalizedShop.replace('.myshopify.com', '');
-            await addStore({
-              name: storeName,
-              domain: normalizedShop,
-              adminToken: shopifyStore.accessToken,
-            });
+            const { updateStore, addStore: _addStore, stores: currentStores } = useStoreManagement.getState();
+            const existingStore = currentStores.find(
+              (s) => s.domain?.toLowerCase().replace(/^https:\/\//, '') === normalizedShop
+            );
+
+            if (existingStore) {
+              console.log('[ShopifyCallback] Updating existing store token (fallback) for', normalizedShop);
+              await updateStore(existingStore.id, { adminToken: shopifyStore.accessToken });
+            } else {
+              await _addStore({
+                name: storeName,
+                domain: normalizedShop,
+                adminToken: shopifyStore.accessToken,
+              });
+            }
           } catch (err) {
-            console.error('[ShopifyCallback] Fallback addStore failed:', err);
+            console.error('[ShopifyCallback] Fallback upsert failed:', err);
             throw err;
           }
         }
@@ -243,7 +266,7 @@ export default function ShopifyCallback() {
     };
 
     handleCallback();
-  }, [searchParams, navigate, addStore]); // addStore is stable (Zustand selector)
+  }, [searchParams, navigate]); // store actions accessed via getState() to avoid stale closures
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-gray-50 px-4">

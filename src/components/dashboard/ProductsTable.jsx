@@ -15,9 +15,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { ArrowUpDown, ArrowUp, ArrowDown, Filter } from "lucide-react";
+import { ArrowUpDown, ArrowUp, ArrowDown, Filter, Code2, ChevronDown, MapPin } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import {
   detectProductFields,
   getNestedValue,
@@ -27,6 +32,101 @@ import { useColumnPreferences } from "@/stores/columnPreferences";
 import { ColumnSelector } from "./ColumnSelector";
 import FilterBuilder from "./FilterBuilder.jsx";
 import { applyFilters } from "@/lib/filterEvaluation";
+import { useCustomColumnsStore } from "@/stores/customColumnsStore";
+import { CustomColumnDialog } from "./CustomColumnDialog";
+import { useOrganization } from "@/stores/organizationStore";
+import { useSalesDataStore } from "@/stores/salesDataStore";
+import { useStoreManagement } from "@/stores/storeManagement";
+import { fetchInventoryLocations } from "@/lib/shopifyInventoryLocations";
+
+/**
+ * Location inventory popover.
+ * - If `locations` (pre-synced from DB) is provided: shows immediately, no API call.
+ * - Otherwise falls back to lazy-fetch via shopify-admin-api proxy on first open.
+ */
+function LocationInventoryPopover({ totalValue, locations: preloadedLocations, variantId, storeConfig }) {
+  const [open, setOpen] = useState(false);
+  const [fetchedLocations, setFetchedLocations] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState(null);
+
+  // Use synced DB data if available; else use what we've lazy-fetched
+  const locations = preloadedLocations ?? fetchedLocations;
+
+  const handleOpenChange = async (nextOpen) => {
+    setOpen(nextOpen);
+    // Only lazy-fetch when we have no pre-loaded data and haven't fetched yet
+    if (nextOpen && !preloadedLocations && fetchedLocations === null && !loading && variantId) {
+      setLoading(true);
+      setFetchError(null);
+      try {
+        const locs = await fetchInventoryLocations(storeConfig, variantId);
+        setFetchedLocations(locs);
+      } catch (e) {
+        setFetchError(e.message);
+      } finally {
+        setLoading(false);
+      }
+    }
+  };
+
+  return (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className={cn(
+            "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium transition-colors",
+            (totalValue || 0) > 10 && "bg-success/10 text-success hover:bg-success/20",
+            (totalValue || 0) <= 10 && (totalValue || 0) > 0 && "bg-warning/10 text-warning hover:bg-warning/20",
+            (totalValue || 0) === 0 && "bg-muted/50 text-muted-foreground hover:bg-muted",
+          )}
+        >
+          {totalValue || 0}
+          <ChevronDown className="h-3 w-3 opacity-60" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent className="w-56 p-0" align="start" sideOffset={6}>
+        <div className="px-3 py-2 border-b flex items-center gap-1.5">
+          <MapPin className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Locations</span>
+        </div>
+        {loading && (
+          <div className="px-3 py-4 text-center text-sm text-muted-foreground">Loading…</div>
+        )}
+        {fetchError && (
+          <div className="px-3 py-3 text-xs text-destructive">{fetchError}</div>
+        )}
+        {!loading && !fetchError && locations && locations.length > 0 && (
+          <>
+            <ul className="py-1">
+              {locations.map((loc, i) => (
+                <li key={i} className="flex items-center justify-between px-3 py-1.5 text-sm hover:bg-muted/40">
+                  <span className="truncate text-foreground/80 max-w-[140px]">{loc.name}</span>
+                  <span className={cn(
+                    "ml-2 tabular-nums font-medium shrink-0",
+                    loc.available > 10 && "text-success",
+                    loc.available <= 10 && loc.available > 0 && "text-warning",
+                    loc.available === 0 && "text-muted-foreground",
+                  )}>
+                    {loc.available}
+                  </span>
+                </li>
+              ))}
+            </ul>
+            <div className="px-3 py-1.5 border-t flex items-center justify-between text-xs text-muted-foreground bg-muted/20">
+              <span>Total available</span>
+              <span className="font-medium">{locations.reduce((s, l) => s + l.available, 0)}</span>
+            </div>
+          </>
+        )}
+        {!loading && !fetchError && locations?.length === 0 && (
+          <div className="px-3 py-3 text-sm text-muted-foreground">No locations found</div>
+        )}
+      </PopoverContent>
+    </Popover>
+  );
+}
 
 /**
  * ProductsTable – supports two modes:
@@ -95,6 +195,8 @@ export function ProductsTable({
   showStoreColumn = false,
   visibleColumns,
   reportMode = false,
+  extraColumns: extraColumnsProp = [],
+  salesMapOverride,
 }) {
   // Detect mode: if initialProducts is supplied, use client-side mode
   const isClientSide = !!initialProducts;
@@ -195,11 +297,26 @@ export function ProductsTable({
   }, []);
 
   const { preferences, initializePreferences } = useColumnPreferences();
+  const { customColumns, loadCustomColumns } = useCustomColumnsStore();
+  const { salesMap: storeSalesMap, isLoading: salesLoading, error: salesError } = useSalesDataStore();
+  // When a pre-fetched map is provided (e.g. public reports), prefer it over the live store
+  const salesMap = salesMapOverride ?? storeSalesMap;
+  const { activeOrganizationId } = useOrganization();
+  const { stores } = useStoreManagement();
+  const [showCustomColumnDialog, setShowCustomColumnDialog] = useState(false);
+
+  // Load persisted custom columns whenever the active org changes
+  useEffect(() => {
+    if (!reportMode) {
+      loadCustomColumns(activeOrganizationId);
+    }
+  }, [activeOrganizationId, reportMode, loadCustomColumns]);
 
   // Detect columns – in client-side mode use full dataset, else current page
   const columnSource = isClientSide ? csAllProducts : products;
   const allColumns = useMemo(() => {
-    if (columnSource.length === 0) return [];
+    // detectProductFields already returns a default column set when products is empty,
+    // so never short-circuit with [] here — that breaks columns on new/reconnected stores.
     const detected = detectProductFields(columnSource);
     if (showStoreColumn && !detected.some((c) => c.key === "storeName")) {
       detected.push({
@@ -210,8 +327,26 @@ export function ProductsTable({
         filterable: true,
       });
     }
-    return detected.filter((col) => !col.hidden);
-  }, [columnSource, showStoreColumn]);
+    const base = detected.filter((col) => !col.hidden);
+    const salesCols = [
+      { key: '__sales_qty__', label: 'Sales Qty', type: 'sales_qty', sortable: false, filterable: false },
+      { key: '__sales_amount__', label: 'Sales Amount', type: 'sales_amount', sortable: false, filterable: false },
+    ];
+    if (reportMode) {
+      // Always include sales cols in allColumns — the columns useMemo filters by visibleColumns.
+      // Custom formula columns are supplied via extraColumnsProp in reportMode.
+      return [...base, ...salesCols];
+    }
+    const customCols = customColumns.map((cc) => ({
+      key: `__custom__${cc.id}`,
+      label: cc.name,
+      type: 'custom',
+      formula: cc.formula,
+      sortable: false,
+      filterable: false,
+    }));
+    return [...base, ...salesCols, ...customCols];
+  }, [columnSource, showStoreColumn, reportMode, customColumns]);
 
   useEffect(() => {
     if (allColumns.length > 0) initializePreferences(allColumns);
@@ -236,9 +371,23 @@ export function ProductsTable({
       });
   }, [allColumns, preferences, reportMode, visibleColumns]);
 
+  // Append user-defined custom columns + built-in sales columns (never shown in reportMode)
+  const finalColumns = useMemo(() => {
+    if (reportMode) {
+      // In report mode, append any extraColumns (e.g. custom columns from EditReport)
+      const extraKeys = new Set(extraColumnsProp.map((c) => c.key));
+      const extra = extraColumnsProp
+        .filter((c) => !visibleColumns || visibleColumns.includes(c.key))
+        .map((c) => ({ ...c, sortable: false, filterable: false }));
+      return [...columns.filter((c) => !extraKeys.has(c.key)), ...extra];
+    }
+    // In normal mode, sales and custom cols are already part of allColumns → columns
+    return columns;
+  }, [columns, reportMode, extraColumnsProp, visibleColumns]);
+
   useEffect(() => {
-    onColumnsChange?.(columns);
-  }, [columns, onColumnsChange]);
+    onColumnsChange?.(finalColumns);
+  }, [finalColumns, onColumnsChange]);
 
   // Pagination derived values
   const pageCount = Math.ceil(totalCount / pageSize);
@@ -293,8 +442,65 @@ export function ProductsTable({
     return () => window.removeEventListener('resize', onResize);
   }, []);
 
+  // Safely evaluate a custom column formula against a product row.
+  // Formula may return a plain value OR { value, color } for colored cells.
+  // color can be any CSS color string e.g. 'red', '#22c55e', 'rgb(...)'
+  const evaluateFormula = (formula, row) => {
+    try {
+      // eslint-disable-next-line no-new-func
+      const fn = new Function('row', `"use strict"; return (${formula})`);
+      const result = fn(row);
+      if (result !== null && result !== undefined && typeof result === 'object' && 'value' in result) {
+        return { value: result.value !== null && result.value !== undefined ? String(result.value) : '—', color: result.color || null };
+      }
+      return { value: result !== null && result !== undefined ? String(result) : '—', color: null };
+    } catch {
+      return { value: '⚠ Error', color: null };
+    }
+  };
+
   // Cell renderer
   const renderCellContent = (product, column) => {
+    if (column.type === 'custom') {
+      const { value: cellValue, color: cellColor } = evaluateFormula(column.formula, product);
+      if (cellColor) {
+        return (
+          <span
+            className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium"
+            style={{ backgroundColor: cellColor + '22', color: cellColor, border: `1px solid ${cellColor}44` }}
+          >
+            {cellValue}
+          </span>
+        );
+      }
+      return (
+        <span className="text-sm text-foreground/85">{cellValue}</span>
+      );
+    }
+
+    if (column.type === 'sales_qty' || column.type === 'sales_amount') {
+      const sku = product.sku || product.variantSku;
+      if (salesLoading) {
+        return <span className="text-xs text-muted-foreground">...</span>;
+      }
+      if (!sku) {
+        return <span className="text-xs text-muted-foreground">—</span>;
+      }
+      const entry = salesMap.get(sku);
+      // If no entry and there was a fetch error, show N/A (plan restriction or scope issue)
+      if (!entry && salesError && salesMap.size === 0) {
+        return <span className="text-xs text-muted-foreground" title={`Sales data unavailable: ${salesError}`}>N/A</span>;
+      }
+      if (column.type === 'sales_qty') {
+        return <span className="text-sm">{entry ? entry.qty.toLocaleString() : '0'}</span>;
+      }
+      return (
+        <span className="text-sm">
+          {entry ? entry.amount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '0.00'}
+        </span>
+      );
+    }
+
     const value = getNestedValue(product, column.key);
 
     if (column.key === "images" || column.type === "image") {
@@ -331,7 +537,25 @@ export function ProductsTable({
         product.priceRange?.minVariantPrice?.currencyCode || "USD",
       );
     if (column.type === "number") {
-      if (column.key === "totalInventory") {
+      if (column.key === "totalInventory" || column.key.endsWith(".totalInventory")) {
+        const syncedLocations = product.locations;
+        const variantId = product.shopify_variant_id;
+        const storeConfig = stores?.find((s) => s.id === product.store_id);
+        // Show popover whenever we have synced location data OR a variantId to lazy-fetch with.
+        // Missing adminToken is handled gracefully inside the popover itself.
+        const canShowPopover =
+          (Array.isArray(syncedLocations) && syncedLocations.length > 0) ||
+          !!variantId;
+        if (canShowPopover) {
+          return (
+            <LocationInventoryPopover
+              totalValue={value}
+              locations={syncedLocations ?? null}
+              variantId={variantId}
+              storeConfig={storeConfig}
+            />
+          );
+        }
         return (
           <span
             className={cn(
@@ -369,6 +593,16 @@ export function ProductsTable({
 
   return (
     <div className="space-y-4">
+      {/* Custom Column Dialog */}
+      {!reportMode && (
+        <CustomColumnDialog
+          open={showCustomColumnDialog}
+          onOpenChange={setShowCustomColumnDialog}
+          organizationId={activeOrganizationId}
+          sampleRow={products[0] || null}
+        />
+      )}
+
       {/* Toolbar */}
       <div className="glass-card rounded-lg p-4">
         <div className="flex flex-wrap gap-3 items-center">
@@ -391,6 +625,23 @@ export function ProductsTable({
           </div>
 
           {!reportMode && <ColumnSelector availableColumns={allColumns} />}
+
+          {!reportMode && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowCustomColumnDialog(true)}
+              className="gap-2"
+            >
+              <Code2 className="h-4 w-4" />
+              Custom Columns
+              {customColumns.length > 0 && (
+                <Badge variant="secondary" className="ml-1">
+                  {customColumns.length}
+                </Badge>
+              )}
+            </Button>
+          )}
 
           {/* Page size */}
           <div className="ml-auto">
@@ -451,7 +702,7 @@ export function ProductsTable({
             <TableHeader>
               <TableRow className="bg-muted/30 hover:bg-muted/30">
                 <TableHead className="w-[50px]">#</TableHead>
-                {columns.map((column) => (
+                {finalColumns.map((column) => (
                   <TableHead
                     key={column.key}
                     className={cn(
@@ -488,7 +739,7 @@ export function ProductsTable({
                   </TableHead>
                 ))}
                 {showStoreColumn &&
-                  !columns.some((c) => c.key === "storeName") && (
+                  !finalColumns.some((c) => c.key === "storeName") && (
                     <TableHead className="relative group">
                       <button
                         onClick={() => handleSort("storeName")}
@@ -511,7 +762,7 @@ export function ProductsTable({
               {products.length === 0 && !isLoadingPage ? (
                 <TableRow>
                   <TableCell
-                    colSpan={columns.length + 1}
+                    colSpan={finalColumns.length + 1}
                     className="text-center py-12 text-muted-foreground"
                   >
                     No products found matching your filters
@@ -531,7 +782,7 @@ export function ProductsTable({
                       <TableCell className="text-foreground/70 text-sm font-medium">
                         {pageIndex * pageSize + index + 1}
                       </TableCell>
-                      {columns.map((column) => (
+                      {finalColumns.map((column) => (
                         <TableCell
                           key={`${productKey}-${column.key}`}
                           className={cn(
@@ -563,7 +814,7 @@ export function ProductsTable({
                         </TableCell>
                       ))}
                       {showStoreColumn &&
-                        !columns.some((c) => c.key === "storeName") && (
+                        !finalColumns.some((c) => c.key === "storeName") && (
                           <TableCell>
                             <Badge variant="secondary" className="font-normal">
                               {product.storeName}

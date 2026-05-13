@@ -20,8 +20,12 @@ export function evaluateCondition(row, condition) {
     return fieldValue !== undefined && fieldValue !== null && fieldValue !== '';
   }
 
-  // If field is blank and we're not checking for blank, return false
+  // If field is blank and we're not checking for blank, return false.
+  // Exception: negative operators (not_equals, not_contains) should MATCH
+  // null/blank rows because "nothing" is indeed "not equal to" and "does not
+  // contain" whatever the user typed.
   if (fieldValue === undefined || fieldValue === null || fieldValue === '') {
+    if (operator === 'not_equals' || operator === 'not_contains') return true;
     return false;
   }
 

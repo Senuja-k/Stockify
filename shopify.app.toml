@@ -7,7 +7,7 @@ application_url = "https://stockify-virid.vercel.app"
 embedded = false
 
 [access_scopes]
-scopes = "write_products,read_products,write_inventory,read_inventory,read_orders,read_customers"
+scopes = "write_products,read_products,write_inventory,read_inventory,read_orders,read_customers,read_analytics"
 
 [auth]
 redirect_urls = [

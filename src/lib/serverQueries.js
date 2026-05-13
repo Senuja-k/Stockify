@@ -57,7 +57,10 @@ async function withRetry(queryFn, label = "query") {
 // ---------------------------------------------------------------------------
 
 function applyConditionToQuery(query, condition) {
+  // data->>'field' extracts JSONB as text; append ::numeric for range comparisons
+  // so values like 9 and 10 compare correctly instead of lexicographically.
   const col = `data->>${condition.field}`;
+  const numCol = `data->>${condition.field}::numeric`;
   const val = condition.value ?? "";
   const val2 = condition.value2 ?? "";
 
@@ -65,28 +68,32 @@ function applyConditionToQuery(query, condition) {
     // ---- String operators ----
     case "equals":
       return query.ilike(col, val);
+
+    // not_equals / not_contains: also include rows where the field is NULL,
+    // because a missing value IS "not equal to" / "does not contain" anything.
     case "not_equals":
-      return query.not(col, "ilike", val);
+      return query.or(`${col}.not.ilike.${val},${col}.is.null`);
     case "contains":
       return query.ilike(col, `%${val}%`);
     case "not_contains":
-      return query.not(col, "ilike", `%${val}%`);
+      return query.or(`${col}.not.ilike.%${val}%,${col}.is.null`);
+
     case "starts_with":
       return query.ilike(col, `${val}%`);
     case "ends_with":
       return query.ilike(col, `%${val}`);
 
-    // ---- Numeric / date operators (string compare; OK for most cases) ----
+    // ---- Numeric operators — cast JSONB text to numeric for correct ordering ----
     case "greater_than":
-      return query.gt(col, val);
+      return query.filter(numCol, "gt", val);
     case "less_than":
-      return query.lt(col, val);
+      return query.filter(numCol, "lt", val);
     case "greater_than_or_equal":
-      return query.gte(col, val);
+      return query.filter(numCol, "gte", val);
     case "less_than_or_equal":
-      return query.lte(col, val);
+      return query.filter(numCol, "lte", val);
     case "between":
-      return query.gte(col, val).lte(col, val2);
+      return query.filter(numCol, "gte", val).filter(numCol, "lte", val2);
 
     // ---- List operators ----
     case "in_list": {
@@ -95,11 +102,11 @@ function applyConditionToQuery(query, condition) {
       return query.in(col, list);
     }
 
-    // ---- Blank checks ----
+    // ---- Blank checks: NULL or empty string ----
     case "is_blank":
-      return query.is(col, null);
+      return query.or(`${col}.is.null,${col}.eq.`);
     case "is_not_blank":
-      return query.not(col, "is", null);
+      return query.not(col, "is", null).neq(col, "");
 
     default:
       console.warn(`[serverQueries] Unknown operator: ${condition.operator}`);
@@ -109,6 +116,7 @@ function applyConditionToQuery(query, condition) {
 
 function conditionToPostgrestString(condition) {
   const col = `data->>${condition.field}`;
+  const numCol = `data->>${condition.field}::numeric`;
   const val = condition.value ?? "";
   const val2 = condition.value2 ?? "";
 
@@ -116,31 +124,33 @@ function conditionToPostgrestString(condition) {
     case "equals":
       return `${col}.ilike.${val}`;
     case "not_equals":
-      return `${col}.not.ilike.${val}`;
+      // Wrap in or() so NULL rows are included
+      return `or(${col}.not.ilike.${val},${col}.is.null)`;
     case "contains":
       return `${col}.ilike.%${val}%`;
     case "not_contains":
-      return `${col}.not.ilike.%${val}%`;
+      return `or(${col}.not.ilike.%${val}%,${col}.is.null)`;
     case "starts_with":
       return `${col}.ilike.${val}%`;
     case "ends_with":
       return `${col}.ilike.%${val}`;
+    // Numeric operators: cast to numeric for correct ordering
     case "greater_than":
-      return `${col}.gt.${val}`;
+      return `${numCol}.gt.${val}`;
     case "less_than":
-      return `${col}.lt.${val}`;
+      return `${numCol}.lt.${val}`;
     case "greater_than_or_equal":
-      return `${col}.gte.${val}`;
+      return `${numCol}.gte.${val}`;
     case "less_than_or_equal":
-      return `${col}.lte.${val}`;
+      return `${numCol}.lte.${val}`;
     case "between":
-      return `and(${col}.gte.${val},${col}.lte.${val2})`;
+      return `and(${numCol}.gte.${val},${numCol}.lte.${val2})`;
     case "in_list": {
       const list = (condition.valueList || []).join(",");
       return `${col}.in.(${list})`;
     }
     case "is_blank":
-      return `${col}.is.null`;
+      return `or(${col}.is.null,${col}.eq.)`;
     case "is_not_blank":
       return `${col}.not.is.null`;
     default:
@@ -316,7 +326,31 @@ export async function queryProductsPage({
 
     const pageCount = Math.ceil(totalCount / pageSize);
 
-    return { data: formatRows(dataResult.data || []), totalCount, pageCount };
+    // Merge per-location inventory from the variant_inventory_locations table
+    const rawRows = dataResult.data || [];
+    const baseRows = formatRows(rawRows);
+
+    if (rawRows.length > 0) {
+      const variantIds = rawRows.map((r) => r.shopify_variant_id).filter(Boolean);
+      const storeIdSet = [...new Set(rawRows.map((r) => r.store_id).filter(Boolean))];
+      const { data: locationRows } = await supabase
+        .from("variant_inventory_locations")
+        .select("shopify_variant_id, store_id, locations")
+        .in("shopify_variant_id", variantIds)
+        .in("store_id", storeIdSet);
+
+      const locMap = {};
+      for (const loc of locationRows || []) {
+        locMap[`${loc.store_id}::${loc.shopify_variant_id}`] = loc.locations;
+      }
+      const mergedRows = baseRows.map((row) => ({
+        ...row,
+        locations: locMap[`${row.store_id}::${row.shopify_variant_id}`] ?? null,
+      }));
+      return { data: mergedRows, totalCount, pageCount };
+    }
+
+    return { data: baseRows, totalCount, pageCount };
   }, "queryProductsPage");
 }
 
@@ -567,15 +601,27 @@ export async function queryAllFilteredProducts({
 function formatRows(rows) {
   return rows.map((row) => {
     const d = row.data || {};
+    // Support both sync paths:
+    // - shopify.js client sync: status/title at top level
+    // - sync-stores edge function: status inside fullProduct, variantData has variant fields
     return {
       ...d,
       id: row.id || d.id,
       store_id: row.store_id,
       shopify_product_id: row.shopify_product_id,
       shopify_variant_id: row.shopify_variant_id,
-      status: d.status || "UNKNOWN",
-      variantPrice: d.variantPrice || d.price || d.variantData?.price,
+      // Prefer top-level title; fall back to fullProduct for sync-stores format
+      title: d.title || d.fullProduct?.title || '',
+      // Prefer top-level status; fall back to fullProduct.status for sync-stores format
+      status: d.status || d.fullProduct?.status || 'UNKNOWN',
+      variantPrice: d.variantPrice || d.variantData?.price || d.price,
       compareAtPrice: d.compareAtPrice || d.variantData?.compareAtPrice,
+      totalInventory: d.totalInventory ?? d.fullProduct?.totalInventory,
+      sku: d.sku || d.variantData?.sku || undefined,
+      barcode: d.barcode || d.variantData?.barcode || undefined,
+      variantSku: d.variantSku || d.variantData?.sku || undefined,
+      variantBarcode: d.variantBarcode || d.variantData?.barcode || undefined,
+      variantTitle: d.variantTitle || d.variantData?.title || undefined,
       variants: [],
     };
   });

@@ -22,6 +22,8 @@ import { useAuth } from "@/stores/authStore.jsx";
 import { useLocation } from "react-router-dom";
 import { getShopifyAuthUrl } from '@/lib/shopify-oauth';
 import { useProductsPageCacheStore } from "@/stores/productsPageCacheStore";
+import { useSalesDataStore } from "@/stores/salesDataStore";
+import { AnalyticsSection } from "@/components/dashboard/AnalyticsSection";
 
 // Helper function to check if an error is an AbortError
 function isAbortError(error) {
@@ -142,6 +144,8 @@ function Index() {
   // --- Data state ---
   const [pageProducts, setPageProducts] = useState([]);
   const [totalCount, setTotalCount] = useState(0);
+  // Rows used by analytics widgets (all rows matching current filter, capped at 5000)
+  const [analyticsRows, setAnalyticsRows] = useState([]);
   const [stats, setStats] = useState({
     totalProducts: 0,
     totalStores: 0,
@@ -179,9 +183,9 @@ function Index() {
   const pageLoadingStartedAtRef = useRef(0);
   const wasHiddenRef = useRef(false);
 
-  // ✅ NEW: prevent double refresh spam on tab return
-  const returnDebounceRef = useRef(0);
-  const tabRefreshInFlightRef = useRef(false);
+  // Tracks latest sort/filter/pageSize for the visibilitychange handler
+  // so the listener doesn't need to be re-registered on every state change.
+  const viewStateRef = useRef({ sortField: null, sortDirection: null, appliedFilterConfig: { items: [] }, pageSize: 25 });
 
   // ✅ NEW: freshness tracking to avoid unnecessary work
   const lastDataFetchAtRef = useRef(0);
@@ -215,18 +219,6 @@ function Index() {
 
   // Cache store (instant restore after reload/back)
   const cache = useProductsPageCacheStore();
-
-  // If the app was backgrounded while on a different route, reload on mount.
-  useEffect(() => {
-    try {
-      const wasHidden = sessionStorage.getItem("app-was-hidden");
-      if (wasHidden) {
-        sessionStorage.removeItem("app-was-hidden");
-        sessionStorage.removeItem("app-last-hidden-at");
-        requestReload("app-was-hidden");
-      }
-    } catch (e) {}
-  }, []);
 
   // -------------------------------------------------------------------
   // Force a fresh data load whenever the dashboard mounts.
@@ -337,6 +329,15 @@ function Index() {
       lastNonEmptyStoresRef.current = storesToFetch;
     }
   }, [storeIds, storesToFetch]);
+
+  // Fetch per-SKU sales data from Shopify Analytics whenever the active stores change
+  const loadSalesData = useSalesDataStore((state) => state.loadSalesData);
+  const salesMap = useSalesDataStore((state) => state.salesMap);
+  useEffect(() => {
+    if (storesToFetch.length > 0) {
+      loadSalesData(storesToFetch);
+    }
+  }, [storesToFetch, loadSalesData]);
 
   // Cache key for instant restore
   const currentCacheKey = useMemo(() => {
@@ -609,6 +610,23 @@ function Index() {
     return () => { cancelled = true; };
   }, [activeOrganizationId, storeIds]);
 
+  // Fetch all rows matching the current filter for analytics widgets (max 5000)
+  useEffect(() => {
+    if (!userId || storeIds.length === 0) return;
+    let cancelled = false;
+    queryAllFilteredProducts({
+      userId,
+      storeIds,
+      organizationId: activeOrganizationId || undefined,
+      filterConfig: appliedFilterConfig,
+      sortField: 'id',
+      sortDirection: 'asc',
+    })
+      .then((rows) => { if (!cancelled) setAnalyticsRows(rows || []); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [userId, storeIds.join(','), activeOrganizationId, appliedFilterConfig]);
+
   // -------------------------------------------------------------------
   // Manual refresh/sync entry point.
   // Sync always runs server-side (Edge Function) so it survives tab
@@ -815,8 +833,15 @@ function Index() {
     });
   }, [pageIndex, sortField, sortDirection, appliedFilterConfig, pageSize]);
 
+  // Keep viewStateRef in sync so the visibilitychange handler always writes fresh values.
+  useEffect(() => {
+    viewStateRef.current = { sortField, sortDirection, appliedFilterConfig, pageSize };
+  }, [sortField, sortDirection, appliedFilterConfig, pageSize]);
+
   // Full page reload when user switches stores in the dropdown.
-  const prevSelectedStoreIdRef = useRef(selectedStoreId);
+  // Use useRef(undefined) so the first-run guard (prev === undefined) always fires
+  // correctly, preventing a spurious reload when the store value first hydrates.
+  const prevSelectedStoreIdRef = useRef(undefined);
   useEffect(() => {
     const prev = prevSelectedStoreIdRef.current;
     prevSelectedStoreIdRef.current = selectedStoreId;
@@ -828,7 +853,7 @@ function Index() {
   }, [selectedStoreId]);
 
   // Full page reload when user switches organization.
-  const prevOrgIdRef = useRef(activeOrganizationId);
+  const prevOrgIdRef = useRef(undefined);
   useEffect(() => {
     const prev = prevOrgIdRef.current;
     prevOrgIdRef.current = activeOrganizationId;
@@ -839,17 +864,19 @@ function Index() {
   }, [activeOrganizationId]);
 
   // Full page reload when user returns to this tab.
-  // Deferred if a product sync is running (requestReload handles the guard).
+  // Uses viewStateRef so the listener is registered once (on mount) and never
+  // stale — no need to re-register every time sort/filter/pageSize changes.
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
         wasHiddenRef.current = true;
+        const vs = viewStateRef.current;
         writeDashboardViewState({
           pageIndex: pageIndexRef.current,
-          sortField,
-          sortDirection,
-          appliedFilterConfig,
-          pageSize,
+          sortField: vs.sortField,
+          sortDirection: vs.sortDirection,
+          appliedFilterConfig: vs.appliedFilterConfig,
+          pageSize: vs.pageSize,
         });
         return;
       }
@@ -864,7 +891,7 @@ function Index() {
     return () => {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [sortField, sortDirection, appliedFilterConfig, pageSize]);
+  }, []);
 
   // Auto-sync logic removed: manual refresh via `checkSyncAndLoad(true)` remains.
 
@@ -1026,7 +1053,7 @@ function Index() {
       console.log('[Index] export: sample', withNames[0]);
 
       // Client-side Excel export
-      exportToExcel(withNames, columnsToExport, "shopify-products");
+      exportToExcel(withNames, columnsToExport, "shopify-products", { salesMap });
       toast({
         title: "Export successful",
         description: `Exported ${withNames.length} products${appliedFilterConfig.items.length > 0 ? " matching your filters" : ""} to Excel.`,
@@ -1144,6 +1171,16 @@ function Index() {
             )}
           </div>
 
+          {/* Analytics widgets — filter-reactive, persisted per org */}
+          {activeOrganizationId && (
+            <div className="glass-card rounded-lg p-3 sm:p-4 w-full">
+              <AnalyticsSection
+                organizationId={activeOrganizationId}
+                filteredRows={analyticsRows}
+              />
+            </div>
+          )}
+
           <div className="space-y-4">
             {showStoresLoading ? (
               <>
@@ -1214,7 +1251,7 @@ function Index() {
                   </p>
                 ) : null}
               </div>
-            ) : storeIds.length > 0 && !lastSyncAt && pageProducts.length === 0 && !isSyncing ? (
+            ) : storeIds.length > 0 && !lastSyncAt && pageProducts.length === 0 && !isSyncing && !isLoadingPage ? (
               <div className="glass-card rounded-lg p-12 text-center">
                 <Store className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
                 <p className="font-medium mb-2">

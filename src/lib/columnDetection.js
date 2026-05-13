@@ -54,8 +54,10 @@ export function detectProductFields(products) {
           fieldMap.set(fullKey, 'number');
         }
       } else if (typeof value === 'object' && value !== null) {
-        // For nested objects, scan them (but skip variants, images, and metafields at root level)
-        if (key !== 'variants' && key !== 'images' && key !== 'metafields') {
+        // For nested objects, scan them (but skip variants, images, metafields, and raw
+        // Shopify API wrappers that create conflicting/duplicate column names)
+        if (key !== 'variants' && key !== 'images' && key !== 'metafields' &&
+            key !== 'variantData' && key !== 'fullProduct') {
           scanObject(value, fullKey, depth + 1);
         }
       }
@@ -134,19 +136,19 @@ export function detectProductFields(products) {
 
 function getDefaultColumns() {
   const defaults = [
-    { key: 'title', label: 'Product', type: 'string', sortable: true, filterable: true, width: 'min-w-[200px]' },
-    { key: 'images', label: 'Image', type: 'image', sortable: true, filterable: true, width: 'w-[80px]' },
-    { key: 'vendor', label: 'Vendor', type: 'string', sortable: true, filterable: true },
-    { key: 'productType', label: 'Type', type: 'string', sortable: true, filterable: true },
-    { key: 'totalInventory', label: 'Inventory', type: 'number', sortable: true, filterable: false },
-    { key: 'createdAt', label: 'Created', type: 'date', sortable: true, filterable: false },
-    { key: 'updatedAt', label: 'Updated', type: 'date', sortable: true, filterable: false },
+    { key: 'title', type: 'string', sortable: true, filterable: true, width: 'min-w-[200px]' },
+    { key: 'images', type: 'image', sortable: true, filterable: true, width: 'w-[80px]' },
+    { key: 'vendor', type: 'string', sortable: true, filterable: true },
+    { key: 'productType', type: 'string', sortable: true, filterable: true },
+    { key: 'totalInventory', type: 'number', sortable: true, filterable: false },
+    { key: 'createdAt', type: 'date', sortable: true, filterable: false },
+    { key: 'updatedAt', type: 'date', sortable: true, filterable: false },
   ];
 
-  // Apply column config customizations
+  // Derive labels from field names so they always match what Shopify provides
   return defaults.map((col) => ({
     ...col,
-    label: COLUMN_CONFIG.columnLabels?.[col.key] || col.label,
+    label: formatColumnLabel(col.key),
     width: COLUMN_CONFIG.columnWidths?.[col.key] || col.width,
   }));
 }

@@ -156,12 +156,12 @@ export function DashboardHeader({
             <div className="text-sm text-muted-foreground">Welcome, <span className="font-medium">{user.name}</span></div>
           )}
 
-          <Button variant="outline" size="sm" onClick={() => navigate("/organizations")} className="gap-2">
+          <Button variant="outline" size="sm" onClick={() => { window.location.href = '/organizations'; }} className="gap-2">
             <Users className="h-4 w-4" />
             Organizations
           </Button>
 
-          <Button variant="outline" size="sm" onClick={() => navigate("/custom-reports")} className="gap-2">
+          <Button variant="outline" size="sm" onClick={() => { window.location.href = '/custom-reports'; }} className="gap-2">
             <FileText className="h-4 w-4" />
             Custom Reports
           </Button>

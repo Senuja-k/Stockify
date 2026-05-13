@@ -52,16 +52,20 @@ async function withRetries(task, label, maxRetries = 3) {
  */
 export async function getOrgLastSyncTime(organizationId, storeIds) {
   try {
+    // Query by organization — not by specific storeIds — so we find existing
+    // sync history even when the selected store ID changed (e.g. after reconnect).
     let query = supabase
       .from('shopify_store_sync_status')
       .select('last_synced_at')
-      .in('store_id', storeIds)
       .not('last_synced_at', 'is', null)
       .order('last_synced_at', { ascending: false })
       .limit(1);
 
     if (organizationId) {
       query = query.eq('organization_id', organizationId);
+    } else if (storeIds && storeIds.length > 0) {
+      // Fallback: no org, filter by storeIds
+      query = query.in('store_id', storeIds);
     }
 
     const { data, error } = await query.maybeSingle();

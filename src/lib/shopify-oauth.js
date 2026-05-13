@@ -12,6 +12,8 @@ const shopifyOAuthConfig = {
     'read_inventory',
     'read_orders',
     'read_customers',
+    'read_analytics',
+    'read_reports',
   ],
 };
 

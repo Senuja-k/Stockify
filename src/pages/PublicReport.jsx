@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useParams } from 'react-router-dom';
 
 import { exportToExcel } from '../lib/exportToExcel';
@@ -288,6 +288,31 @@ export function PublicReport() {
   const [filterConfig, setFilterConfig] = useState({ items: [] });
   const [isExporting, setIsExporting] = useState(false);
 
+  // Computed products from report's custom code (null = use raw fetchState.products)
+  const [computedProducts, setComputedProducts] = useState(null);
+  const [codeColumns, setCodeColumns] = useState([]);
+  const [codeStats, setCodeStats] = useState([]);
+  // Sales data fetched from shopify_sales table (populated during sync)
+  const [publicSalesMap, setPublicSalesMap] = useState(new Map());
+
+  // Compute stat values reactively from filtered products, respecting saved order
+  const statValues = useMemo(() => {
+    if (!codeStats.length) return [];
+    const base = computedProducts ?? fetchState.products;
+    const filtered = filterConfig?.items?.length ? applyFilters(base, filterConfig) : base;
+    const mapped = codeStats.map((stat) => {
+      try { return { key: stat.key, label: stat.label, value: stat.compute(filtered) }; }
+      catch { return { key: stat.key, label: stat.label, value: '—' }; }
+    });
+    const savedOrder = report?.codeStatOrder;
+    if (!Array.isArray(savedOrder) || !savedOrder.length) return mapped;
+    return [...mapped].sort((a, b) => {
+      const ai = savedOrder.indexOf(a.key);
+      const bi = savedOrder.indexOf(b.key);
+      return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    });
+  }, [codeStats, computedProducts, fetchState.products, filterConfig, report?.codeStatOrder]);
+
   // AbortController ref for managing request cancellation
   const abortControllerRef = useRef(null);
 
@@ -385,13 +410,49 @@ export function PublicReport() {
         return {
           ...productData,
           id: v.id || v.shopify_product_id || productData.id,
+          store_id: v.store_id,
           shopify_variant_id: v.shopify_variant_id,
-          title: productData.title || '',
-          status: productData.status || 'UNKNOWN',
+          // Prefer top-level title; fall back to fullProduct for sync-stores format
+          title: productData.title || productData.fullProduct?.title || '',
+          // Prefer top-level status; fall back to fullProduct.status for sync-stores format
+          status: productData.status || productData.fullProduct?.status || 'UNKNOWN',
           storeId: v.store_id,
           storeName: productData.storeName || '',
+          // Hoist totalInventory so the popover check works
+          totalInventory: productData.totalInventory ?? productData.fullProduct?.totalInventory,
+          variantPrice: productData.variantPrice || productData.variantData?.price || productData.price,
+          compareAtPrice: productData.compareAtPrice || productData.variantData?.compareAtPrice,
+          sku: productData.sku || productData.variantData?.sku || undefined,
+          barcode: productData.barcode || productData.variantData?.barcode || undefined,
+          variantSku: productData.variantSku || productData.variantData?.sku || undefined,
+          variantBarcode: productData.variantBarcode || productData.variantData?.barcode || undefined,
+          variantTitle: productData.variantTitle || productData.variantData?.title || undefined,
         };
       });
+
+      // Merge per-location inventory from variant_inventory_locations
+      try {
+        const variantIds = formattedProducts.map((p) => p.shopify_variant_id).filter(Boolean);
+        const storeIds = [...new Set(formattedProducts.map((p) => p.store_id).filter(Boolean))];
+        if (variantIds.length > 0 && storeIds.length > 0) {
+          const { data: locationRows } = await supabasePublic
+            .from('variant_inventory_locations')
+            .select('shopify_variant_id, store_id, locations')
+            .in('shopify_variant_id', variantIds)
+            .in('store_id', storeIds);
+          if (locationRows?.length) {
+            const locMap = {};
+            for (const loc of locationRows) {
+              locMap[`${loc.store_id}::${loc.shopify_variant_id}`] = loc.locations;
+            }
+            formattedProducts.forEach((p) => {
+              p.locations = locMap[`${p.store_id}::${p.shopify_variant_id}`] ?? null;
+            });
+          }
+        }
+      } catch (_locErr) {
+        // non-fatal — popover will lazy-fetch on open if needed
+      }
 
       // Deduplicate by variant ID
       const seenVariantIds = new Set();
@@ -410,6 +471,62 @@ export function PublicReport() {
         products: deduplicatedProducts,
         lastSyncAt: result.lastSyncAt,
       });
+
+      // Load persisted sales data from shopify_sales (best-effort, non-fatal)
+      try {
+        const storeIds = [...new Set(deduplicatedProducts.map((p) => p.store_id).filter(Boolean))];
+        if (storeIds.length > 0) {
+          const { data: salesRows } = await supabasePublic
+            .from('shopify_sales')
+            .select('sku, sales_qty, sales_amount')
+            .in('store_id', storeIds);
+          if (salesRows?.length) {
+            const map = new Map();
+            for (const row of salesRows) {
+              const existing = map.get(row.sku);
+              if (existing) {
+                map.set(row.sku, {
+                  qty: existing.qty + (row.sales_qty || 0),
+                  amount: existing.amount + parseFloat(row.sales_amount || 0),
+                });
+              } else {
+                map.set(row.sku, { qty: row.sales_qty || 0, amount: parseFloat(row.sales_amount || 0) });
+              }
+            }
+            setPublicSalesMap(map);
+          }
+        }
+      } catch (_salesErr) {
+        // non-fatal — sales columns will show 0
+      }
+
+      // Auto-apply the report's custom code so computed columns show for this report
+      const savedCode = (report?.customCode || '').trim();
+      if (savedCode) {
+        try {
+          // eslint-disable-next-line no-new-func
+          const fn = new Function(savedCode);
+          const raw = fn();
+          const columns = Array.isArray(raw) ? raw : (raw?.columns || []);
+          const stats = Array.isArray(raw) ? [] : (raw?.stats || []);
+          if (columns.every((c) => c.key && c.label && typeof c.compute === 'function')) {
+            const enriched = deduplicatedProducts.map((row) => {
+              const extra = {};
+              for (const col of columns) {
+                try { extra[col.key] = col.compute(row); } catch { extra[col.key] = ''; }
+              }
+              return { ...row, ...extra };
+            });
+            setCodeColumns(columns);
+            setComputedProducts(enriched);
+          }
+          if (stats.every((s) => s.key && s.label && typeof s.compute === 'function')) {
+            setCodeStats(stats);
+          }
+        } catch {
+          // silently skip if code errors
+        }
+      }
     } catch (error) {
       // AbortErrors are expected during re-renders — handle silently
       if (isAbortError(error)) {
@@ -483,7 +600,10 @@ export function PublicReport() {
 
     setIsExporting(true);
     try {
-      const filteredProducts = applyFilters(fetchState.products, filterConfig);
+      // Use computedProducts when available — it has code-column values baked in.
+      // Fall back to base fetchState.products if no custom code was applied.
+      const baseProducts = computedProducts ?? fetchState.products;
+      const filteredProducts = applyFilters(baseProducts, filterConfig);
 
       if (filteredProducts.length === 0) {
         toast({
@@ -494,22 +614,33 @@ export function PublicReport() {
         return;
       }
 
-      // Determine columns to export. Prefer the report's selected columns.
-      // If none are defined on the master report, fall back to detected columns
-      // based on the current product data so exports still work.
-      let columnsToExport = Array.isArray(report?.selectedColumns) ? report.selectedColumns : [];
-      if (!columnsToExport || columnsToExport.length === 0) {
-        const detected = detectProductFields(filteredProducts || []);
-        columnsToExport = detected.map((c) => c.key);
-      }
+      // Build full column objects so exportToExcel gets labels and types.
+      // Start with detected Shopify fields, then add any code columns.
+      const detected = detectProductFields(filteredProducts);
+      const detectedMap = new Map(detected.map((c) => [c.key, c]));
+
+      // Map code columns (from savedCode) to exportable objects
+      const codeColDefs = codeColumns.map((c) => ({
+        key: c.key,
+        label: c.label || c.key,
+        type: 'string',
+      }));
+      codeColDefs.forEach((c) => detectedMap.set(c.key, c));
+
+      // Determine which keys to export (from report's saved selection or all detected)
+      const selectedKeys = Array.isArray(report?.selectedColumns) && report.selectedColumns.length > 0
+        ? [
+            ...report.selectedColumns,
+            // also include any code columns not already in selectedColumns
+            ...codeColDefs.filter((c) => !report.selectedColumns.includes(c.key)).map((c) => c.key),
+          ]
+        : [...detectedMap.keys()];
+
+      // Resolve to full column objects (strings fall back to a basic definition)
+      const columnsToExport = selectedKeys.map((k) => detectedMap.get(k) || { key: k, label: k, type: 'string' });
 
       const filename = `${report.name}-${new Date().toISOString().split('T')[0]}`;
-
-      // Debug logging to help diagnose export issues in the wild
-      console.log('[PublicReport] export: columnsToExport', columnsToExport);
-      console.log('[PublicReport] export: sample product', filteredProducts[0]);
-
-      exportToExcel(filteredProducts, columnsToExport, filename);
+      exportToExcel(filteredProducts, columnsToExport, filename, { salesMap: publicSalesMap });
       toast({
         title: 'Export successful',
         description: `Exported ${filteredProducts.length} products`,
@@ -699,13 +830,29 @@ export function PublicReport() {
 
         {/* Success state: Products table */}
         {fetchState.status === 'success' && fetchState.products.length > 0 && (
-          <ProductsTable
-            initialProducts={fetchState.products}
-            visibleColumns={report.selectedColumns}
-            reportMode={true}
-            initialFilterConfig={filterConfig}
-            onFilterConfigChange={setFilterConfig}
-          />
+          <>
+            {statValues.length > 0 && (
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3 mb-4 px-4">
+                {statValues.map((s) => (
+                  <div key={s.key} className="rounded-lg border bg-muted/40 px-4 py-3">
+                    <p className="text-xs text-muted-foreground mb-1">{s.label}</p>
+                    <p className="text-lg font-semibold leading-none">{s.value ?? '—'}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+            <ProductsTable
+              initialProducts={computedProducts ?? fetchState.products}
+              visibleColumns={[
+                ...(report.selectedColumns || []),
+                ...codeColumns.filter((c) => !(report.selectedColumns || []).includes(c.key)).map((c) => c.key),
+              ]}
+              reportMode={true}
+              initialFilterConfig={filterConfig}
+              onFilterConfigChange={setFilterConfig}
+              salesMapOverride={publicSalesMap.size > 0 ? publicSalesMap : undefined}
+            />
+          </>
         )}
       </div>
     </div>

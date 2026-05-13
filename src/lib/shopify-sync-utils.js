@@ -545,10 +545,19 @@ export async function getVariantsByStore(
         id: row.id || productData.id,
         store_id: row.store_id,
         shopify_product_id: row.shopify_product_id,
-        status: productData.status || 'UNKNOWN',
-        variantPrice: productData.variantPrice || productData.price,
-        // Remove price field to avoid duplicate column
-        price: row.price,
+        // Prefer top-level title; fall back to fullProduct for sync-stores format
+        title: productData.title || productData.fullProduct?.title || '',
+        // Prefer top-level status; fall back to fullProduct.status for sync-stores format
+        status: productData.status || productData.fullProduct?.status || 'UNKNOWN',
+        variantPrice: productData.variantPrice || productData.variantData?.price || productData.price,
+        compareAtPrice: productData.compareAtPrice || productData.variantData?.compareAtPrice,
+        totalInventory: productData.totalInventory ?? productData.fullProduct?.totalInventory,
+        // Hoist variant fields from variantData (sync-stores format) to top level
+        sku: productData.sku || productData.variantData?.sku || undefined,
+        barcode: productData.barcode || productData.variantData?.barcode || undefined,
+        variantSku: productData.variantSku || productData.variantData?.sku || undefined,
+        variantBarcode: productData.variantBarcode || productData.variantData?.barcode || undefined,
+        variantTitle: productData.variantTitle || productData.variantData?.title || undefined,
         // Ensure variants array exists for flattening
         variants: Array.isArray(productData.variants) ? productData.variants : [],
       };
@@ -625,9 +634,16 @@ export async function getVariantsByStorePaginated(
       return {
         ...productData,
         store_id: row.store_id,
-        status: productData.status || 'UNKNOWN',
-        variantPrice: productData.variantPrice || productData.price,
-        price: row.price,
+        title: productData.title || productData.fullProduct?.title || '',
+        status: productData.status || productData.fullProduct?.status || 'UNKNOWN',
+        variantPrice: productData.variantPrice || productData.variantData?.price || productData.price,
+        compareAtPrice: productData.compareAtPrice || productData.variantData?.compareAtPrice,
+        totalInventory: productData.totalInventory ?? productData.fullProduct?.totalInventory,
+        sku: productData.sku || productData.variantData?.sku || undefined,
+        barcode: productData.barcode || productData.variantData?.barcode || undefined,
+        variantSku: productData.variantSku || productData.variantData?.sku || undefined,
+        variantBarcode: productData.variantBarcode || productData.variantData?.barcode || undefined,
+        variantTitle: productData.variantTitle || productData.variantData?.title || undefined,
       };
     });
 
@@ -749,9 +765,16 @@ export async function getAllVariantsByStore(
               store_id: row.store_id,
               shopify_product_id: row.shopify_product_id,
               shopify_variant_id: row.shopify_variant_id, // This row IS a specific variant
-              status: productData.status || 'UNKNOWN',
-              variantPrice: productData.variantPrice || productData.price,
-              price: row.price,
+              title: productData.title || productData.fullProduct?.title || '',
+              status: productData.status || productData.fullProduct?.status || 'UNKNOWN',
+              variantPrice: productData.variantPrice || productData.variantData?.price || productData.price,
+              compareAtPrice: productData.compareAtPrice || productData.variantData?.compareAtPrice,
+              totalInventory: productData.totalInventory ?? productData.fullProduct?.totalInventory,
+              sku: productData.sku || productData.variantData?.sku || undefined,
+              barcode: productData.barcode || productData.variantData?.barcode || undefined,
+              variantSku: productData.variantSku || productData.variantData?.sku || undefined,
+              variantBarcode: productData.variantBarcode || productData.variantData?.barcode || undefined,
+              variantTitle: productData.variantTitle || productData.variantData?.title || undefined,
               variants: [], // DON'T include variants array - this row already IS a single variant
             };
           });
