@@ -266,6 +266,7 @@ export function PublicReport() {
 
   // Report metadata state (fetched from Supabase — works for ANY user/browser)
   const [reportData, setReportData] = useState(null);
+  const report = reportData;
   const [reportLoading, setReportLoading] = useState(true);
 
   // Password authentication state
@@ -315,9 +316,6 @@ export function PublicReport() {
 
   // AbortController ref for managing request cancellation
   const abortControllerRef = useRef(null);
-
-  // The report is always fetched from Supabase — no local/Zustand dependency
-  const report = reportData;
 
   // ============= EFFECT: Load Report Metadata =============
   // Always fetches from Supabase using the public (anon) client so it works
