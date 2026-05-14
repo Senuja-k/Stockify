@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import { useAuth } from '@/stores/authStore.jsx';
 import {
   addOrganizationMemberByEmail,
   createOrganizationForUser,
@@ -28,6 +27,7 @@ export const useOrganization = create()(
           return;
         }
 
+        const { useAuth } = await import('@/stores/authStore.jsx');
         const { isAuthenticated, user } = useAuth.getState();
         if (!isAuthenticated) {
           
@@ -99,6 +99,7 @@ export const useOrganization = create()(
 
         set({ isLoading: true, error: null });
         try {
+          const { useAuth } = await import('@/stores/authStore.jsx');
           const { user } = useAuth.getState();
           if (!user) throw new Error('User not authenticated');
 
@@ -173,6 +174,7 @@ export const useOrganization = create()(
       },
 
       deleteOrganization: async (organizationId) => {
+        const { useAuth } = await import('@/stores/authStore.jsx');
         const { user } = useAuth.getState();
         if (!user) throw new Error('User not authenticated');
 
