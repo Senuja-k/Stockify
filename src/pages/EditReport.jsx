@@ -438,12 +438,18 @@ return {
 
     setIsSaving(true);
     try {
+      // Embed custom column definitions so the public viewer can render them without auth
+      const customColumnDefs = customColumns
+        .filter((cc) => selectedColumns.includes(`__custom__${cc.id}`))
+        .map((cc) => ({ key: `__custom__${cc.id}`, name: cc.name, formula: cc.formula }));
+
       await updateReport(report.id, {
         name: reportName,
         selectedColumns,
         filterConfig,
         customCode,
         codeStatOrder: statOrder,
+        customColumnDefs,
       });
 
       toast({

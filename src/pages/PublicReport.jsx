@@ -849,6 +849,12 @@ export function PublicReport() {
               initialFilterConfig={filterConfig}
               onFilterConfigChange={setFilterConfig}
               salesMapOverride={publicSalesMap.size > 0 ? publicSalesMap : undefined}
+              extraColumns={(report.customColumnDefs || []).map((cc) => ({
+                key: cc.key,
+                label: cc.name,
+                type: 'custom',
+                formula: cc.formula,
+              }))}
             />
           </>
         )}
