@@ -220,9 +220,16 @@ function ConditionRow({
 				}}
 			>
 				<SelectTrigger className="w-[200px]">
-					<SelectValue />
+					<SelectValue placeholder="Select column..." />
 				</SelectTrigger>
 				<SelectContent>
+					{/* If the stored field key is not (yet) in availableColumns, show it as a
+					    disabled placeholder so the row never appears completely blank */}
+					{condition.field && !availableColumns.find(c => c.key === condition.field) && (
+						<SelectItem value={condition.field} disabled className="text-muted-foreground italic">
+							{condition.field}
+						</SelectItem>
+					)}
 					{availableColumns.map((col) => (
 						<SelectItem key={col.key} value={col.key}>
 							{col.label}

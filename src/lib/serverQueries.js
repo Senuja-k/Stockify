@@ -158,6 +158,11 @@ function conditionToPostgrestString(condition) {
   }
 }
 
+// Sales columns are computed client-side from a separate salesMap and do not exist as
+// fields in the JSONB `data` column. Skip them here — ProductsTable applies them
+// client-side as a post-filter after the server results arrive.
+const SALES_COLUMN_KEYS = new Set(['__sales_qty__', '__sales_amount__']);
+
 function applyFiltersToQuery(query, filterConfig) {
   if (!filterConfig?.items?.length) return query;
 
@@ -166,7 +171,9 @@ function applyFiltersToQuery(query, filterConfig) {
 
   for (const item of filterConfig.items) {
     if (typeof item === "object" && item && "id" in item) {
-      conditions.push(item);
+      if (!SALES_COLUMN_KEYS.has(item.field)) {
+        conditions.push(item);
+      }
     } else if (typeof item === "string") {
       logicOps.push(item);
     }

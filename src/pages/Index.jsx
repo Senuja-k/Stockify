@@ -330,7 +330,8 @@ function Index() {
     }
   }, [storeIds, storesToFetch]);
 
-  // Fetch per-SKU sales data from Shopify Analytics whenever the active stores change
+  // Load per-SKU sales totals. Tries shopify_sales DB table first (populated on sync),
+  // falls back to a live Shopify API call if the table is empty.
   const loadSalesData = useSalesDataStore((state) => state.loadSalesData);
   const salesMap = useSalesDataStore((state) => state.salesMap);
   useEffect(() => {
@@ -750,6 +751,11 @@ function Index() {
           _isSyncingGlobal = false;
           isSyncingRef.current = false;
           try { useProductsStore.getState().setIsSyncing(false); } catch {}
+          // Refresh sales data — the sync just wrote fresh rows to shopify_sales.
+          try {
+            useSalesDataStore.getState().invalidate();
+            useSalesDataStore.getState().loadSalesData(storesToFetch);
+          } catch (_) {}
           // If a reload was deferred while syncing, do it now.
           try {
             const pending = sessionStorage.getItem(RELOAD_PENDING_KEY);

@@ -15,7 +15,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { ArrowUpDown, ArrowUp, ArrowDown, Filter, Code2, ChevronDown, MapPin } from "lucide-react";
+import { ArrowUpDown, ArrowUp, ArrowDown, Code2, ChevronDown, MapPin } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -38,6 +38,10 @@ import { useOrganization } from "@/stores/organizationStore";
 import { useSalesDataStore } from "@/stores/salesDataStore";
 import { useStoreManagement } from "@/stores/storeManagement";
 import { fetchInventoryLocations } from "@/lib/shopifyInventoryLocations";
+
+// Sales column keys are computed from salesMap at render time, not stored on product objects.
+// Used to separate sales conditions from DB-filterable conditions.
+const SALES_COLUMN_KEYS = new Set(['__sales_qty__', '__sales_amount__']);
 
 /**
  * Location inventory popover.
@@ -219,13 +223,25 @@ export function ProductsTable({
     ? csFilterConfig
     : appliedFilterConfig || { items: [] };
 
+  // Sales data — brought in early so csFiltered can use salesMap for Sales Qty/Amount conditions
+  const { salesMap: storeSalesMap, isLoading: salesLoading, error: salesError } = useSalesDataStore();
+  const salesMap = salesMapOverride ?? storeSalesMap;
+
   // Client-side: apply filters → sort → paginate
   const csAllProducts = initialProducts || [];
 
   const csFiltered = useMemo(() => {
     if (!isClientSide) return [];
-    return applyFilters(csAllProducts, csFilterConfig);
-  }, [isClientSide, csAllProducts, csFilterConfig]);
+    // Enrich each product with its computed sales values so filter conditions on
+    // __sales_qty__ / __sales_amount__ evaluate correctly (those fields don't exist
+    // on the raw product objects — they are looked up from salesMap at render time).
+    const enriched = csAllProducts.map((p) => {
+      const sku = p.sku || p.variantSku;
+      const entry = sku ? salesMap.get(sku) : null;
+      return { ...p, __sales_qty__: entry?.qty ?? 0, __sales_amount__: entry?.amount ?? 0 };
+    });
+    return applyFilters(enriched, csFilterConfig);
+  }, [isClientSide, csAllProducts, csFilterConfig, salesMap]);
 
   const csSorted = useMemo(() => {
     if (!isClientSide || !csSortField) return csFiltered;
@@ -253,8 +269,28 @@ export function ProductsTable({
   // The products to render + total count
   const products = isClientSide ? csPageProducts : pageProducts || [];
   const totalCount = isClientSide ? csTotalCount : (externalTotalCount ?? 0);
-  const [showFilters, setShowFilters] = useState(false);
 
+  // Server-side post-filter for sales columns: the DB query can't filter __sales_qty__ /
+  // __sales_amount__ (they're not in the JSONB data column). We strip them from the server
+  // query (see serverQueries.js) and re-apply them here after the page results arrive.
+  const salesPostFilter = useMemo(() => {
+    if (isClientSide) return null;
+    const config = appliedFilterConfig || { items: [] };
+    const salesItems = config.items.filter(
+      (item) => typeof item === 'object' && item && 'id' in item && SALES_COLUMN_KEYS.has(item.field),
+    );
+    return salesItems.length > 0 ? { items: salesItems } : null;
+  }, [isClientSide, appliedFilterConfig]);
+
+  const displayProducts = useMemo(() => {
+    if (isClientSide || !salesPostFilter) return products;
+    const enriched = products.map((p) => {
+      const sku = p.sku || p.variantSku;
+      const entry = sku ? salesMap.get(sku) : null;
+      return { ...p, __sales_qty__: entry?.qty ?? 0, __sales_amount__: entry?.amount ?? 0 };
+    });
+    return applyFilters(enriched, salesPostFilter);
+  }, [isClientSide, products, salesPostFilter, salesMap]);
   // Column resizing state
   const [columnWidths, setColumnWidths] = useState({});
   const resizingColumnRef = useRef(null);
@@ -296,11 +332,14 @@ export function ProductsTable({
     };
   }, []);
 
-  const { preferences, initializePreferences } = useColumnPreferences();
+  const { preferences, initializePreferences, loadPreferences } = useColumnPreferences();
+
+  // Load column preferences from the database once on mount
+  useEffect(() => {
+    loadPreferences();
+  }, [loadPreferences]);
+
   const { customColumns, loadCustomColumns } = useCustomColumnsStore();
-  const { salesMap: storeSalesMap, isLoading: salesLoading, error: salesError } = useSalesDataStore();
-  // When a pre-fetched map is provided (e.g. public reports), prefer it over the live store
-  const salesMap = salesMapOverride ?? storeSalesMap;
   const { activeOrganizationId } = useOrganization();
   const { stores } = useStoreManagement();
   const [showCustomColumnDialog, setShowCustomColumnDialog] = useState(false);
@@ -351,6 +390,23 @@ export function ProductsTable({
   useEffect(() => {
     if (allColumns.length > 0) initializePreferences(allColumns);
   }, [allColumns, initializePreferences]);
+
+  // Stable column list for FilterBuilder — only grows, never shrinks.
+  // When the current page returns 0 results, detectProductFields() falls back to
+  // a minimal default set, which would cause existing filter field dropdowns to go
+  // blank because their stored key is no longer in availableColumns.  We keep the
+  // largest column set we've ever seen so the filter UI stays consistent.
+  const [stableFilterColumns, setStableFilterColumns] = useState([]);
+  useEffect(() => {
+    if (allColumns.length === 0) return;
+    setStableFilterColumns((prev) => {
+      const prevKeys = new Set(prev.map((c) => c.key));
+      const added = allColumns.filter((c) => !prevKeys.has(c.key));
+      if (added.length === 0) return prev;
+      return [...prev, ...added];
+    });
+  }, [allColumns]);
+  const filterColumns = stableFilterColumns.length > 0 ? stableFilterColumns : allColumns;
 
   // Visible / ordered columns
   const columns = useMemo(() => {
@@ -599,31 +655,13 @@ export function ProductsTable({
           open={showCustomColumnDialog}
           onOpenChange={setShowCustomColumnDialog}
           organizationId={activeOrganizationId}
-          sampleRow={products[0] || null}
+          sampleRow={displayProducts[0] || null}
         />
       )}
 
       {/* Toolbar */}
       <div className="glass-card rounded-lg p-4">
         <div className="flex flex-wrap gap-3 items-center">
-          {/* Filter toggle */}
-          <div className="flex-1">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setShowFilters(!showFilters)}
-              className="gap-2"
-            >
-              <Filter className="h-4 w-4" />
-              {showFilters ? "Hide Filters" : "Show Filters"}
-              {activeFilterCount > 0 && (
-                <Badge variant="secondary" className="ml-1">
-                  {activeFilterCount}
-                </Badge>
-              )}
-            </Button>
-          </div>
-
           {!reportMode && <ColumnSelector availableColumns={allColumns} />}
 
           {!reportMode && (
@@ -674,24 +712,22 @@ export function ProductsTable({
           </div>
         </div>
 
-        {/* Filter builder (draft-based, with Apply button) */}
-        {showFilters && (
-          <div className="mt-4 p-4 border rounded-lg bg-muted/50">
-            <FilterBuilder
-              config={filterConfig}
-              onApply={(config) => {
-                if (isClientSide) {
-                  setCsFilterConfig(config);
-                  setCsPageIndex(0);
-                  onFilterConfigChange?.(config);
-                } else {
-                  onFilterApply?.(config);
-                }
-              }}
-              availableColumns={allColumns}
-            />
-          </div>
-        )}
+        {/* Filter builder (always visible) */}
+        <div className="mt-4 p-4 border rounded-lg bg-muted/50">
+          <FilterBuilder
+            config={filterConfig}
+            onApply={(config) => {
+              if (isClientSide) {
+                setCsFilterConfig(config);
+                setCsPageIndex(0);
+                onFilterConfigChange?.(config);
+              } else {
+                onFilterApply?.(config);
+              }
+            }}
+            availableColumns={filterColumns}
+          />
+        </div>
       </div>
 
       {/* Table / Mobile list */}
@@ -759,7 +795,7 @@ export function ProductsTable({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {products.length === 0 && !isLoadingPage ? (
+              {displayProducts.length === 0 && !isLoadingPage ? (
                 <TableRow>
                   <TableCell
                     colSpan={finalColumns.length + 1}
@@ -769,7 +805,7 @@ export function ProductsTable({
                   </TableCell>
                 </TableRow>
               ) : (
-                products.map((product, index) => {
+                displayProducts.map((product, index) => {
                   const variantId = product.variantId;
                   const productKey = variantId
                     ? `${product.id}-${variantId}-${index}`

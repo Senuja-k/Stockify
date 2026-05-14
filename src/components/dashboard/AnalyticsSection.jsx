@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
 import { useAnalyticsWidgetsStore } from '@/stores/analyticsWidgetsStore';
 import { useCustomColumnsStore } from '@/stores/customColumnsStore';
+import { useSalesDataStore } from '@/stores/salesDataStore';
 import { AnalyticsWidgetCard } from './AnalyticsWidgetCard';
 import { AnalyticsWidgetBuilder } from './AnalyticsWidgetBuilder';
 import { toast } from '@/hooks/use-toast';
@@ -35,6 +36,7 @@ function evalCustomFormula(formula, row) {
 export function AnalyticsSection({ organizationId, filteredRows = [] }) {
   const { widgets, isLoading, loadWidgets, addWidget, removeWidget } = useAnalyticsWidgetsStore();
   const { customColumns, loadCustomColumns } = useCustomColumnsStore();
+  const salesMap = useSalesDataStore((state) => state.salesMap);
   const [builderOpen, setBuilderOpen] = useState(false);
 
   // Load custom columns for this org
@@ -42,17 +44,23 @@ export function AnalyticsSection({ organizationId, filteredRows = [] }) {
     if (organizationId) loadCustomColumns(organizationId);
   }, [organizationId, loadCustomColumns]);
 
-  // Enrich filteredRows with computed custom column values so widgets can aggregate them
+  // Enrich filteredRows with sales data + computed custom column values
   const enrichedRows = useMemo(() => {
-    if (!customColumns.length) return filteredRows;
     return filteredRows.map((row) => {
+      const sku = row.sku || row.variantSku;
+      const sales = sku ? (salesMap.get(sku) ?? { qty: 0, amount: 0 }) : { qty: 0, amount: 0 };
+      const salesFields = {
+        __sales_qty__: sales.qty,
+        __sales_amount__: sales.amount,
+      };
+      if (!customColumns.length) return { ...row, ...salesFields };
       const extra = {};
       for (const cc of customColumns) {
         extra[`__custom__${cc.id}`] = evalCustomFormula(cc.formula, row);
       }
-      return { ...row, ...extra };
+      return { ...row, ...salesFields, ...extra };
     });
-  }, [filteredRows, customColumns]);
+  }, [filteredRows, salesMap, customColumns]);
 
   // Extra column descriptors to pass to the builder (custom columns)
   const extraColumns = useMemo(

@@ -21,8 +21,11 @@ function computeWidgetData(rows, widget) {
   // Custom formula always produces a scalar for "card", or can return an array for charts
   if (widget.aggregation === 'custom' && widget.formula) {
     try {
+      // Try expression mode first; fall back to block mode for multi-statement code
       // eslint-disable-next-line no-new-func
-      const fn = new Function('rows', `"use strict"; return (${widget.formula})`);
+      let fn;
+      try { fn = new Function('rows', `"use strict"; return (${widget.formula})`); }
+      catch { fn = new Function('rows', `"use strict"; ${widget.formula}`); }
       return fn(rows);
     } catch {
       return null;
