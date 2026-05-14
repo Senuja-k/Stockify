@@ -417,6 +417,22 @@ return {
     });
   }, [customColumns]);
 
+  // Fallback: if loadCustomColumns failed (e.g. session expired), use the
+  // customColumnDefs embedded in the report so they still appear in the picker
+  useEffect(() => {
+    if (customColumns.length) return; // store loaded fine — no fallback needed
+    const defs = report?.customColumnDefs;
+    if (!Array.isArray(defs) || !defs.length) return;
+    setAvailableColumns((prev) => {
+      const existingKeys = new Set(prev.map((c) => c.key));
+      const newCols = defs
+        .filter((cc) => !existingKeys.has(cc.key))
+        .map((cc) => ({ key: cc.key, label: cc.name, type: 'custom' }));
+      if (!newCols.length) return prev;
+      return [...prev, ...newCols];
+    });
+  }, [customColumns.length, report?.customColumnDefs]);
+
   const handleSaveChanges = async () => {
     if (!report || !reportName.trim()) {
       toast({

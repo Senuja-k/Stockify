@@ -189,12 +189,13 @@ export async function saveReport(userId, organizationId, report) {
   try {
     // Map camelCase to snake_case for database
     // codeStatOrder has no dedicated column — embed it inside the filters JSONB
-    const { createdAt, updatedAt, selectedColumns, filterConfig, shareLink, storeId, storeName, organizationId: _orgId, codeStatOrder, customCode, ...reportData } = report;
+    const { createdAt, updatedAt, selectedColumns, filterConfig, shareLink, storeId, storeName, organizationId: _orgId, codeStatOrder, customCode, customColumnDefs, ...reportData } = report;
     
     const filtersPayload = {
       ...(filterConfig || {}),
       ...(Array.isArray(codeStatOrder) && codeStatOrder.length ? { __codeStatOrder: codeStatOrder } : {}),
       ...(customCode ? { __customCode: customCode } : {}),
+      ...(Array.isArray(customColumnDefs) && customColumnDefs.length ? { __customColumnDefs: customColumnDefs } : {}),
     };
 
     const { error } = await supabase
@@ -239,13 +240,14 @@ export async function getReports(userId, organizationId) {
     // Map snake_case back to camelCase
     return (data || []).map(report => {
       const rawFilters = report.filters || {};
-      const { __codeStatOrder, __customCode, ...filterItems } = rawFilters;
+      const { __codeStatOrder, __customCode, __customColumnDefs, ...filterItems } = rawFilters;
       return {
         ...report,
         selectedColumns: report.selected_columns || [],
         filterConfig: filterItems,
         codeStatOrder: Array.isArray(__codeStatOrder) ? __codeStatOrder : null,
         customCode: __customCode || null,
+        customColumnDefs: Array.isArray(__customColumnDefs) ? __customColumnDefs : [],
         createdAt: report.created_at,
         updatedAt: report.updated_at,
         storeId: report.store_id,
@@ -282,13 +284,14 @@ export async function getReportByShareLink(shareLink) {
     
     // Map snake_case back to camelCase
     const rawFilters = data.filters || {};
-    const { __codeStatOrder, __customCode, ...filterItems } = rawFilters;
+    const { __codeStatOrder, __customCode, __customColumnDefs, ...filterItems } = rawFilters;
     return {
       ...data,
       selectedColumns: data.selected_columns || [],
       filterConfig: filterItems,
       codeStatOrder: Array.isArray(__codeStatOrder) ? __codeStatOrder : null,
       customCode: __customCode || null,
+      customColumnDefs: Array.isArray(__customColumnDefs) ? __customColumnDefs : [],
       createdAt: data.created_at,
       updatedAt: data.updated_at,
       storeId: data.store_id,
