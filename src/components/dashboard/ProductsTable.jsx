@@ -590,7 +590,7 @@ export function ProductsTable({
       return formatColumnValue(
         value,
         "currency",
-        product.priceRange?.minVariantPrice?.currencyCode || "USD",
+        product.currencyCode || product.priceRange?.minVariantPrice?.currencyCode,
       );
     if (column.type === "number") {
       if (column.key === "totalInventory" || column.key.endsWith(".totalInventory")) {

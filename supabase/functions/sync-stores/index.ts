@@ -18,7 +18,24 @@ function normalizeDomain(domain) {
   return String(domain).trim().replace(/^https?:\/\//, '').replace(/\/$/, '');
 }
 
-async function fetchAllProductsForStore(domain, adminToken) {
+async function fetchStoreCurrency(domain: string, adminToken: string): Promise<string> {
+  const API_VER = '2025-07';
+  const url = `https://${domain}/admin/api/${API_VER}/graphql.json`;
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': adminToken },
+      body: JSON.stringify({ query: '{ shop { currencyCode } }' }),
+    });
+    if (!resp.ok) return 'USD';
+    const json = await resp.json();
+    return json.data?.shop?.currencyCode || 'USD';
+  } catch {
+    return 'USD';
+  }
+}
+
+async function fetchAllProductsForStore(domain: string, adminToken: string, currencyCode: string = 'USD') {
   const API_VER = '2025-07';
   const url = `https://${domain}/admin/api/${API_VER}/graphql.json`;
   const allProducts = [];
@@ -61,6 +78,17 @@ async function fetchAllProductsForStore(domain, adminToken) {
                   price
                   compareAtPrice
                   inventoryQuantity
+                }
+              }
+            }
+            metafields(first: 250) {
+              edges {
+                node {
+                  id
+                  namespace
+                  key
+                  value
+                  type
                 }
               }
             }
@@ -118,9 +146,15 @@ async function fetchAllProductsForStore(domain, adminToken) {
       handle: product.handle,
       vendor: product.vendor,
       productType: product.productType,
+      status: product.status || 'ACTIVE',
+      totalInventory: product.totalInventory ?? 0,
       updatedAt: product.updatedAt,
       createdAt: product.createdAt,
       image: (product.images?.edges?.[0]?.node?.url) || null,
+      variantPrice: v.price ? String(v.price) : null,
+      compareAtPrice: v.compareAtPrice ? String(v.compareAtPrice) : null,
+      currencyCode,
+      metafields: (product.metafields?.edges || []).map((e: any) => e.node),
       variantData: v,
       fullProduct: product,
     };
@@ -336,7 +370,8 @@ serve(async (req) => {
           continue;
         }
 
-        const products = await fetchAllProductsForStore(domain, adminToken);
+        const currencyCode = await fetchStoreCurrency(domain, adminToken);
+        const products = await fetchAllProductsForStore(domain, adminToken, currencyCode);
 
         // Prepare rows for upsert
         const rows = products.map((p) => ({
