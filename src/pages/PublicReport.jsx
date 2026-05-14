@@ -425,6 +425,8 @@ export function PublicReport() {
           variantSku: productData.variantSku || productData.variantData?.sku || undefined,
           variantBarcode: productData.variantBarcode || productData.variantData?.barcode || undefined,
           variantTitle: productData.variantTitle || productData.variantData?.title || undefined,
+          // Normalize image to a plain string URL regardless of sync format
+          image: productData.image || productData.images?.edges?.[0]?.node?.url || null,
         };
       });
 

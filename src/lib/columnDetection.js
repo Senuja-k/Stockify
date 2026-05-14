@@ -1,201 +1,150 @@
-import { COLUMN_CONFIG } from '@/lib/columnConfig';
+
+// Fields to always skip during scanning (internal system / DB fields)
+const SKIP_FIELDS = new Set([
+  'id', '_id', 'storeId', 'store_id', 'user_id', 'organization_id',
+  'shopify_product_id', 'shopify_variant_id',
+  'productId', 'variantId',
+  'metafields', 'variants', 'variantData', 'fullProduct',
+  'priceRange', 'currencyCode', 'price',
+  'images',           // GraphQL edge object – normalized to 'image' string in data loader
+  'synced_at', 'db_created_at', 'db_updated_at',
+]);
+
+// Force a specific type for known fields regardless of value type
+const FIELD_TYPE_OVERRIDES = {
+  image:             'image',
+  variantPrice:      'currency',
+  compareAtPrice:    'currency',
+  totalInventory:    'number',
+  inventoryQuantity: 'number',
+  createdAt:         'date',
+  updatedAt:         'date',
+  publishedAt:       'date',
+  created_at:        'date',
+  updated_at:        'date',
+};
+
+// Well-known fields shown first in this exact order
+const FIELD_PRIORITY = [
+  'image', 'title', 'vendor', 'productType', 'status',
+  'variantTitle', 'variantSku', 'sku', 'variantBarcode', 'barcode',
+  'variantPrice', 'compareAtPrice', 'totalInventory',
+  'description', 'handle', 'storeName', 'createdAt', 'updatedAt', 'publishedAt',
+];
 
 /**
- * Recursively scan products to detect available fields and their types
+ * Fully data-driven column detection.
+ * Scans every field present in the product data (including all custom metafields).
+ * Only Sales Qty / Sales Amount columns are hardcoded – those are appended in
+ * ProductsTable and EditReport, not here.
  */
 export function detectProductFields(products) {
-  if (products.length === 0) {
-    return getDefaultColumns();
-  }
+  if (!products || products.length === 0) return [];
 
   const fieldMap = new Map();
-  
-  // Sample first product for field detection
-  const sample = products[0];
-  
-  // Check if we have Admin API data (has metafields)
-  let hasBarcode = false;
-  if (sample.variants) {
-    const variantArray = Array.isArray(sample.variants) ? sample.variants : (sample.variants).edges?.map((e) => e.node) || [];
-    hasBarcode = variantArray.some((v) => v?.hasOwnProperty('barcode'));
-  }
 
-  // Scan first product for basic fields
-  const scanObject = (obj, prefix = '', depth = 0) => {
-    if (!obj || typeof obj !== 'object' || depth > 3) return; // Limit depth to avoid infinite recursion
+  // Sample up to 100 products for basic field detection (performance)
+  const sample = products.length > 100 ? products.slice(0, 100) : products;
 
-    for (const [key, value] of Object.entries(obj)) {
-      // Skip internal/complex fields
-      if (key.startsWith('_') || key === 'id' || key === 'storeId') continue;
-
-      const fullKey = prefix ? `${prefix}.${key}` : key;
-
+  sample.forEach((product) => {
+    if (!product || typeof product !== 'object') return;
+    for (const [key, value] of Object.entries(product)) {
+      // Skip internal fields and custom/formula column keys (start with __)
+      if (SKIP_FIELDS.has(key) || key.startsWith('__')) continue;
       if (value === null || value === undefined) continue;
 
-      // Detect field type
-      if (Array.isArray(value)) {
-        // Skip metafields and variants here - we'll handle them separately below
-        if (key === 'metafields' || key === 'variants') {
-          continue;
-        }
-        // For other arrays, continue without processing
-        continue;
-      } else if (typeof value === 'string') {
-        // Check if it looks like a date
-        if (key.includes('At') && !fieldMap.has(fullKey)) {
-          fieldMap.set(fullKey, 'date');
-        } else if (key.includes('Price') || key.includes('Amount')) {
-          fieldMap.set(fullKey, 'currency');
-        } else if (!fieldMap.has(fullKey)) {
-          fieldMap.set(fullKey, 'string');
-        }
-      } else if (typeof value === 'number') {
-        if (!fieldMap.has(fullKey)) {
-          fieldMap.set(fullKey, 'number');
-        }
-      } else if (typeof value === 'object' && value !== null) {
-        // For nested objects, scan them (but skip variants, images, metafields, and raw
-        // Shopify API wrappers that create conflicting/duplicate column names)
-        if (key !== 'variants' && key !== 'images' && key !== 'metafields' &&
-            key !== 'variantData' && key !== 'fullProduct') {
-          scanObject(value, fullKey, depth + 1);
+      // Skip objects and arrays – they are either noise or handled separately
+      if (Array.isArray(value) || typeof value === 'object') continue;
+
+      if (!fieldMap.has(key)) {
+        const override = FIELD_TYPE_OVERRIDES[key];
+        if (override) {
+          fieldMap.set(key, override);
+        } else if (typeof value === 'number') {
+          fieldMap.set(key, 'number');
+        } else if (typeof value === 'boolean') {
+          fieldMap.set(key, 'boolean');
+        } else if (typeof value === 'string') {
+          if ((key.endsWith('At') || key.endsWith('_at')) && value.includes('T')) {
+            fieldMap.set(key, 'date');
+          } else if (key.toLowerCase().includes('price') || key.toLowerCase().includes('amount')) {
+            fieldMap.set(key, 'currency');
+          } else {
+            fieldMap.set(key, 'string');
+          }
         }
       }
     }
-  };
-
-  scanObject(sample);
-
-  // Scan ALL products for metafields (not just first one) to collect all possible metafield keys
-  const allMetafieldKeys = new Set();
-  products.forEach((product, index) => {
-    if (product.metafields && Array.isArray(product.metafields)) {
-      product.metafields.forEach((meta) => {
-        if (meta && meta.key) {
-          allMetafieldKeys.add(meta.key);
-        }
-      });
-    }
   });
 
-  // Add all discovered metafield keys to fieldMap
-  allMetafieldKeys.forEach((key) => {
-    const metaKey = `metafield.${key}`;
-    fieldMap.set(metaKey, 'string');
-  });
-
-  // Check variants for variant-specific fields (SKU, barcode, price, compareAtPrice)
-  // Since products are already flattened, look for variantSku, variantBarcode, variantPrice, compareAtPrice
-  let hasVariantSku = false;
-  let hasVariantBarcode = false;
-  let hasVariantPrice = false;
-  let hasCompareAtPrice = false;
-  
+  // Scan ALL products for metafields – every unique metafield key becomes a column
   products.forEach((product) => {
-    if (product.hasOwnProperty('variantSku')) hasVariantSku = true;
-    if (product.hasOwnProperty('variantBarcode')) hasVariantBarcode = true;
-    if (product.hasOwnProperty('variantPrice')) hasVariantPrice = true;
-    if (product.hasOwnProperty('compareAtPrice')) hasCompareAtPrice = true;
+    if (!product?.metafields || !Array.isArray(product.metafields)) return;
+    product.metafields.forEach((meta) => {
+      if (!meta?.key) return;
+      const colKey = `metafield.${meta.key}`;
+      if (!fieldMap.has(colKey)) {
+        const mfType = meta.type || '';
+        let colType = 'string';
+        if (mfType.includes('integer') || mfType.includes('decimal') || mfType.includes('rating')) {
+          colType = 'number';
+        } else if (mfType.includes('date')) {
+          colType = 'date';
+        } else if (mfType.includes('money')) {
+          colType = 'currency';
+        }
+        fieldMap.set(colKey, colType);
+      }
+    });
   });
 
-  if (hasVariantSku) {
-    fieldMap.set('variantSku', 'string');
-  }
-  if (hasVariantBarcode) {
-    fieldMap.set('variantBarcode', 'string');
-  }
-  if (hasVariantPrice) {
-    fieldMap.set('variantPrice', 'currency');
-  }
-  if (hasCompareAtPrice) {
-    fieldMap.set('compareAtPrice', 'currency');
-  }
-
-  // Convert to column definitions
-  const columns = Array.from(fieldMap.entries()).map(
-    ([key, type]) => ({
-      key,
-      label: formatColumnLabel(key),
-      type,
-      sortable: type !== 'object',
-      filterable: type === 'string',
-      hidden: shouldHideField(key),
-    })
-  );
-
-  // Ensure essential columns are at the top
-  const essentialColumns = getDefaultColumns();
-  const essentialKeys = new Set(essentialColumns.map((c) => c.key));
-
-  // Reorder: essential first, then others
-  return [
-    ...essentialColumns.filter((col) => columns.some((c) => c.key === col.key)),
-    ...columns.filter((col) => !essentialKeys.has(col.key)),
-  ];
-}
-
-function getDefaultColumns() {
-  const defaults = [
-    { key: 'title', type: 'string', sortable: true, filterable: true, width: 'min-w-[200px]' },
-    { key: 'images', type: 'image', sortable: true, filterable: true, width: 'w-[80px]' },
-    { key: 'vendor', type: 'string', sortable: true, filterable: true },
-    { key: 'productType', type: 'string', sortable: true, filterable: true },
-    { key: 'totalInventory', type: 'number', sortable: true, filterable: false },
-    { key: 'createdAt', type: 'date', sortable: true, filterable: false },
-    { key: 'updatedAt', type: 'date', sortable: true, filterable: false },
-  ];
-
-  // Derive labels from field names so they always match what Shopify provides
-  return defaults.map((col) => ({
-    ...col,
-    label: formatColumnLabel(col.key),
-    width: COLUMN_CONFIG.columnWidths?.[col.key] || col.width,
+  // Build column definitions
+  const columns = Array.from(fieldMap.entries()).map(([key, type]) => ({
+    key,
+    label: formatColumnLabel(key),
+    type,
+    sortable: type !== 'image' && type !== 'boolean',
+    filterable: type === 'string' || type === 'number' || type === 'currency',
+    hidden: false,
   }));
+
+  // Sort: priority fields first in defined order, then regular fields alpha, then metafields alpha
+  return columns.sort((a, b) => {
+    const pa = FIELD_PRIORITY.indexOf(a.key);
+    const pb = FIELD_PRIORITY.indexOf(b.key);
+    if (pa !== -1 && pb !== -1) return pa - pb;
+    if (pa !== -1) return -1;
+    if (pb !== -1) return 1;
+    const aMeta = a.key.startsWith('metafield.');
+    const bMeta = b.key.startsWith('metafield.');
+    if (aMeta && !bMeta) return 1;
+    if (!aMeta && bMeta) return -1;
+    return a.label.localeCompare(b.label);
+  });
 }
 
 function formatColumnLabel(key) {
-  // Special labels for specific fields
   if (key === 'sku') return 'SKU';
   if (key === 'barcode') return 'Barcode';
-  if (key === 'price') return 'Price';
+  if (key === 'image') return 'Image';
   if (key === 'variantSku') return 'Variant SKU';
   if (key === 'variantBarcode') return 'Variant Barcode';
   if (key === 'variantPrice') return 'Variant Price';
+  if (key === 'compareAtPrice') return 'Compare At Price';
+  if (key === 'totalInventory') return 'Total Inventory';
+  if (key === 'productType') return 'Product Type';
+  if (key === 'variantTitle') return 'Variant Title';
+  if (key === 'storeName') return 'Store';
   if (key.startsWith('metafield.')) {
     const metaKey = key.replace('metafield.', '');
     return metaKey.replace(/_/g, ' ').replace(/\b\w/g, (l) => l.toUpperCase());
   }
-  
   return key
     .split('.')
     .pop()
     ?.replace(/([A-Z])/g, ' $1')
     .replace(/^./, (str) => str.toUpperCase())
     .trim() || key;
-}
-
-function shouldHideField(key) {
-  const hiddenPatterns = [
-    'description',
-    'publishedAt',
-    'handle',
-    'variants',
-    'priceRange', // Hide all priceRange fields
-    'currencyCode',
-    'edges', // Hide GraphQL edges
-    'node', // Hide GraphQL node wrapper
-  ];
-  // Never hide metafields or variant-related fields
-  // Hide 'price' but keep 'variantPrice'
-  if (key.startsWith('metafield.') || key === 'sku' || key === 'barcode' || 
-      key === 'variantSku' || key === 'variantBarcode' || key === 'variantPrice' || key === 'variantId' || key === 'variantTitle') {
-    return false;
-  }
-  // Explicitly hide the 'price' field
-  if (key === 'price') {
-    return true;
-  }
-  return hiddenPatterns.some((pattern) => key.includes(pattern));
 }
 
 /**

@@ -629,6 +629,8 @@ function formatRows(rows) {
       variantSku: d.variantSku || d.variantData?.sku || undefined,
       variantBarcode: d.variantBarcode || d.variantData?.barcode || undefined,
       variantTitle: d.variantTitle || d.variantData?.title || undefined,
+      // Normalize image to a plain string URL regardless of sync format
+      image: d.image || d.images?.edges?.[0]?.node?.url || null,
       variants: [],
     };
   });

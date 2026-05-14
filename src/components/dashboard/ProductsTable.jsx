@@ -354,8 +354,8 @@ export function ProductsTable({
   // Detect columns – in client-side mode use full dataset, else current page
   const columnSource = isClientSide ? csAllProducts : products;
   const allColumns = useMemo(() => {
-    // detectProductFields already returns a default column set when products is empty,
-    // so never short-circuit with [] here — that breaks columns on new/reconnected stores.
+    // detectProductFields is fully data-driven — returns all fields present in products.
+    // When products is empty the list is empty; sales + custom cols are always appended.
     const detected = detectProductFields(columnSource);
     if (showStoreColumn && !detected.some((c) => c.key === "storeName")) {
       detected.push({
@@ -366,6 +366,7 @@ export function ProductsTable({
         filterable: true,
       });
     }
+    // detected columns never have hidden:true in the new system; filter kept for safety
     const base = detected.filter((col) => !col.hidden);
     const salesCols = [
       { key: '__sales_qty__', label: 'Sales Qty', type: 'sales_qty', sortable: false, filterable: false },
@@ -559,13 +560,14 @@ export function ProductsTable({
 
     const value = getNestedValue(product, column.key);
 
-    if (column.key === "images" || column.type === "image") {
+    if (column.key === "image" || column.key === "images" || column.type === "image") {
+      const imgUrl = product.image || product.images?.edges?.[0]?.node?.url;
       return (
         <div className="w-10 h-10 rounded-md overflow-hidden bg-muted flex items-center justify-center">
-          {product.images?.edges?.[0]?.node?.url ? (
+          {imgUrl ? (
             <img
-              src={product.images.edges[0].node.url}
-              alt={product.images.edges[0].node.altText || product.title}
+              src={imgUrl}
+              alt={product.title}
               className="w-full h-full object-cover"
             />
           ) : (

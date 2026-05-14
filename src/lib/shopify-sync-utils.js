@@ -558,6 +558,8 @@ export async function getVariantsByStore(
         variantSku: productData.variantSku || productData.variantData?.sku || undefined,
         variantBarcode: productData.variantBarcode || productData.variantData?.barcode || undefined,
         variantTitle: productData.variantTitle || productData.variantData?.title || undefined,
+        // Normalize image to a plain string URL regardless of sync format
+        image: productData.image || productData.images?.edges?.[0]?.node?.url || null,
         // Ensure variants array exists for flattening
         variants: Array.isArray(productData.variants) ? productData.variants : [],
       };
@@ -644,6 +646,8 @@ export async function getVariantsByStorePaginated(
         variantSku: productData.variantSku || productData.variantData?.sku || undefined,
         variantBarcode: productData.variantBarcode || productData.variantData?.barcode || undefined,
         variantTitle: productData.variantTitle || productData.variantData?.title || undefined,
+        // Normalize image to a plain string URL regardless of sync format
+        image: productData.image || productData.images?.edges?.[0]?.node?.url || null,
       };
     });
 
